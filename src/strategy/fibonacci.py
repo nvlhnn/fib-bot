@@ -182,10 +182,6 @@ class FibonacciScorer:
         )
         if entry <= 0 or stop <= 0 or tp <= 0:
             return None
-        rr = self._risk_reward(entry, stop, tp, direction)
-        if rr < cfg.get("min_rr", 1.2):
-            return None
-
         quality, size_mult = self._quality_tier(total)
         return self._signal(
             ind, direction, entry, stop, tp, total, quality, size_mult, regime_name,
@@ -340,35 +336,39 @@ class FibonacciScorer:
         atr: float,
         cfg: dict,
     ) -> tuple[float, float, float]:
-        """Zone-aware exits for Fib pullbacks.
+        """Return exits for Fib pullbacks.
 
-        Use nearer invalidation levels instead of always hiding behind the full
-        swing origin. TP first tries the conservative 0.236 retracement; if that
-        gives too little reward, use the nearest target that satisfies min RR.
+        Default live mode is fixed PnL: with fixed margin + leverage, set SL/TP
+        at equal dollar distance (e.g. -$5 / +$5).
         """
+        if cfg.get("exit_mode", "fixed_pnl") == "fixed_pnl":
+            margin = cfg.get("fixed_margin_usdt", 5.0)
+            leverage = cfg.get("fixed_leverage", 50)
+            notional = margin * leverage
+            risk_usdt = cfg.get("stop_loss_usdt", 5.0)
+            reward_usdt = cfg.get("take_profit_usdt", risk_usdt)
+            if notional <= 0:
+                return current, 0.0, 0.0
+            stop_pct = risk_usdt / notional
+            tp_pct = reward_usdt / notional
+            if direction == "LONG":
+                return current, current * (1 - stop_pct), current * (1 + tp_pct)
+            return current, current * (1 + stop_pct), current * (1 - tp_pct)
+
         buffer = max(
             atr * cfg.get("stop_atr_buffer", 0.35),
             current * cfg.get("min_stop_pct", 0.2) / 100.0,
         )
         target_level = cfg.get("pullback_take_profit_retracement", 0.236)
-        min_rr = cfg.get("min_rr", 1.2)
 
         if direction == "LONG":
             stop_base = self._long_stop_base(swing, zone.level, cfg)
             stop = stop_base - buffer
             tp = self._retracement_price(swing, target_level)
-            if self._risk_reward(current, stop, tp, direction) < min_rr:
-                tp = current + (current - stop) * min_rr
-                if tp > swing.end_price:
-                    return current, stop, 0.0
         else:
             stop_base = self._short_stop_base(swing, zone.level, cfg)
             stop = stop_base + buffer
             tp = self._retracement_price(swing, target_level)
-            if self._risk_reward(current, stop, tp, direction) < min_rr:
-                tp = current - (stop - current) * min_rr
-                if tp < swing.end_price:
-                    return current, stop, 0.0
         return current, stop, tp
 
     def _long_stop_base(self, swing: Swing, entry_level: float, cfg: dict) -> float:

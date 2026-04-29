@@ -89,6 +89,22 @@ class RiskManager:
         The position size is derived from how much we're willing to LOSE,
         not from available margin.
         """
+        pos_cfg = self._cfg.risk_config.get("position", {})
+        if pos_cfg.get("sizing_mode") == "fixed_margin":
+            margin_required = float(pos_cfg.get("fixed_margin_usdt", 5.0))
+            leverage = int(pos_cfg.get("fixed_leverage", self._cfg.base_leverage))
+            position_size = margin_required * leverage
+            stop_dist_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
+            risk_amount = position_size * stop_dist_pct
+            return {
+                "position_size": round(position_size, 2),
+                "margin_required": round(margin_required, 2),
+                "risk_amount": round(risk_amount, 4),
+                "risk_pct_actual": round((risk_amount / balance) * 100, 2) if balance > 0 else 0,
+                "leverage": leverage,
+                "stop_distance_pct": round(stop_dist_pct * 100, 3),
+            }
+
         risk_pct = self._cfg.risk_per_trade_pct
         max_margin_pct = self._cfg.max_margin_pct
 
