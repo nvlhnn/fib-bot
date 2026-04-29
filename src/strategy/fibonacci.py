@@ -241,12 +241,23 @@ class FibonacciScorer:
         return zones
 
     def _retracement_zones(self, swing: Swing, cfg: dict) -> list[FibZone]:
+        """Return pullback zones measured from impulse end back toward origin.
+
+        This matches the common chart workflow: draw Fib from swing high to
+        swing low for a bearish impulse and short the bounce at 0.382/0.5/0.618;
+        inverse for bullish pullbacks.
+        """
         tolerance = cfg.get("zone_tolerance_pct", 0.12) / 100.0
         zones = []
-        for level in cfg.get("pullback_retracements", [0.5, 0.618]):
-            price = self._fib_price(swing, level)
+        for level in cfg.get("pullback_retracements", [0.382, 0.5, 0.618]):
+            price = self._retracement_price(swing, level)
             zones.append(FibZone(f"ret_{level}", price * (1 - tolerance), price * (1 + tolerance), level))
         return zones
+
+    def _retracement_price(self, swing: Swing, level: float) -> float:
+        if swing.direction == "UP":
+            return swing.end_price - swing.size * level
+        return swing.end_price + swing.size * level
 
     def _fib_price(self, swing: Swing, level: float) -> float:
         if swing.direction == "UP":
