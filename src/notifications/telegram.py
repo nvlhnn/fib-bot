@@ -214,13 +214,13 @@ class TelegramNotifier:
     async def bot_started(self, mode: str, balance: float, coins: int) -> None:
         """Bot startup notification."""
         msg = (
-            f"🚀 <b>TDB Bot Started</b>\n"
+            f"🚀 <b>FIB Bot Started</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"Mode:    {mode.upper()}\n"
             f"Balance: ${balance:.2f}\n"
             f"Coins:   {coins} active\n"
             f"\n"
-            f"Strategy: MCS (Momentum Confluence Scalper)"
+            f"Strategy: FIB (Fibonacci Reversal/Pullback)"
         )
         await self._send(msg)
 

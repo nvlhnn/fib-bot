@@ -1,0 +1,16 @@
+[Unit]
+Description=FIB Scalper Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/fib-scalper
+EnvironmentFile=/root/.openclaw/workspace/fib-scalper/.env
+ExecStart=/root/.openclaw/workspace/fib-scalper/venv/bin/python /root/.openclaw/workspace/fib-scalper/main.py --testnet
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

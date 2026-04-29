@@ -1,7 +1,7 @@
 """
-TDB — Trading Daily Bot (Entry Point)
+FIB Scalper — Entry Point
 
-Momentum Confluence Scalper targeting $5-10/day on $50 balance.
+Configurable Fibonacci futures bot for USDT-M markets.
 
 Usage:
     python main.py              # Run with default config
@@ -28,7 +28,7 @@ from src.core.bot import Bot
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="TDB — Momentum Confluence Scalper",
+        description="FIB Scalper — Fibonacci Futures Bot",
     )
     parser.add_argument(
         "--testnet",
@@ -88,7 +88,7 @@ async def main() -> None:
         return
 
     mode = config.bot_mode
-    logger.info("Starting TDB in {} mode...", mode.upper())
+    logger.info("Starting FIB Scalper in {} mode...", mode.upper())
 
     # Create and start bot
     bot = Bot(config)

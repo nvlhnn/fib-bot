@@ -2,12 +2,34 @@
 # STRATEGY PARAMETERS
 # ──────────────────────────────────────────────────────────
 strategy:
-  name: "MCS"
+  name: "FIB"
 
   timeframes:
     entry: "5m"
     regime: "15m"
     trend: "1h"
+
+  # Fibonacci strategy
+  # mode can be: reversal, trend_pullback, confluence
+  fibonacci:
+    mode: "reversal"
+    swing_lookback: 96
+    max_swing_age: 48
+    min_impulse_atr: 2.0
+    min_impulse_pct: 0.4
+    reversal_extensions: [1.272, 1.618]
+    pullback_retracements: [0.382, 0.5, 0.618, 0.786]
+    reversal_take_profit_retracement: 0.618
+    zone_tolerance_pct: 0.12
+    volume_ratio_min: 1.2
+    require_confirmation: true
+    require_volume: false
+    trend_filter: true
+    avoid_dead_regime: true
+    divergence_lookback: 24
+    stop_atr_buffer: 0.35
+    min_stop_pct: 0.2
+    fallback_rr: 1.5
 
   # Layer 1: Regime Detection
   regime:
@@ -135,8 +157,8 @@ execution:
 # ──────────────────────────────────────────────────────────
 risk:
   position:
-    risk_per_trade_pct: 2.0
-    max_margin_pct: 25.0
+    risk_per_trade_pct: 0.5
+    max_margin_pct: 10.0
     min_order_value: 5.0
 
   leverage:
@@ -146,7 +168,7 @@ risk:
     dynamic: true
 
   limits:
-    max_open_positions: 10
+    max_open_positions: 3
     max_daily_trades: 0
     max_same_direction: 2
 
@@ -210,7 +232,7 @@ logging:
 # DATABASE
 # ──────────────────────────────────────────────────────────
 database:
-  path: "data/tdb.db"
+  path: "data/fib.db"
   backup:
     enabled: true
     interval_hours: 24

@@ -1,1 +1,1 @@
-"""TDB — Trading Daily Bot (Momentum Confluence Scalper)."""
+"""FIB Scalper — Fibonacci Futures bot."""

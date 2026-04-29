@@ -21,14 +21,14 @@ from src.database.db import Database
 from src.exchange.binance_client import BinanceClient
 from src.notifications.telegram import TelegramNotifier
 from src.risk.risk_manager import RiskManager
-from src.strategy.confluence import ConfluenceScorer
+from src.strategy.fibonacci import FibonacciScorer
 from src.strategy.engine import IndicatorEngine
 from src.strategy.screener import CoinScanner
 
 
 class Bot:
     """
-    TDB Bot — Momentum Confluence Scalper.
+    FIB Bot — Fibonacci Scalper.
 
     Coordinates all subsystems and runs the 3-tier async event loop.
     """
@@ -44,7 +44,7 @@ class Bot:
         self.risk_manager = RiskManager(config, self.db)
         self.screener = CoinScanner(config, self.client)
         self.indicator_engine = IndicatorEngine(config)
-        self.confluence = ConfluenceScorer(config)
+        self.strategy = FibonacciScorer(config)
         self.candle_cache = CandleCache()
 
         # Position tracking
@@ -60,7 +60,7 @@ class Bot:
     async def start(self) -> None:
         """Initialize all systems and start the event loop."""
         logger.info("=" * 60)
-        logger.info("TDB Bot — Momentum Confluence Scalper")
+        logger.info("FIB Bot — Fibonacci Scalper")
         logger.info("=" * 60)
 
         # Connect subsystems
@@ -203,14 +203,14 @@ class Bot:
                         symbol, candles_5m, candles_15m, candles_1h,
                     )
 
-                    # Run confluence
-                    signal = self.confluence.evaluate(ind_set, rsi_hist, price_hist)
+                    # Run Fibonacci strategy
+                    signal = self.strategy.evaluate(ind_set, rsi_hist, price_hist, candles_5m, candles_15m, candles_1h)
 
                     if signal is not None:
                         signal.timestamp = int(time.time() * 1000)
                         all_signals.append(signal)
                         logger.info(
-                            "  {} {} — score {}/13 ({})",
+                            "  {} {} — FIB score {} ({})",
                             signal.direction, signal.symbol,
                             signal.confluence_score, signal.quality,
                         )
