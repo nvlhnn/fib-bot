@@ -19,6 +19,10 @@ strategy:
     min_impulse_pct: 0.4
     reversal_extensions: [1.272, 1.618]
     pullback_retracements: [0.382, 0.5, 0.618]
+    pullback_take_profit_retracement: 0.236
+    shallow_entry_stop_level: 0.618
+    deep_entry_stop_level: 0.786
+    min_rr: 1.2
     reversal_take_profit_retracement: 0.618
     zone_tolerance_pct: 0.12
     volume_ratio_min: 1.2

@@ -177,8 +177,13 @@ class FibonacciScorer:
         if total < self._cfg.scoring_config.get("min_score", 5):
             return None
 
-        entry, stop, tp = self._pullback_levels(ind.current_price, swing, direction, ind.atr, cfg)
+        entry, stop, tp = self._pullback_levels(
+            ind.current_price, swing, zone, direction, ind.atr, cfg,
+        )
         if entry <= 0 or stop <= 0 or tp <= 0:
+            return None
+        rr = self._risk_reward(entry, stop, tp, direction)
+        if rr < cfg.get("min_rr", 1.2):
             return None
 
         quality, size_mult = self._quality_tier(total)
@@ -330,18 +335,62 @@ class FibonacciScorer:
         self,
         current: float,
         swing: Swing,
+        zone: FibZone,
         direction: str,
         atr: float,
         cfg: dict,
     ) -> tuple[float, float, float]:
-        buffer = max(atr * cfg.get("stop_atr_buffer", 0.35), current * cfg.get("min_stop_pct", 0.2) / 100.0)
+        """Zone-aware exits for Fib pullbacks.
+
+        Use nearer invalidation levels instead of always hiding behind the full
+        swing origin. TP first tries the conservative 0.236 retracement; if that
+        gives too little reward, use the nearest target that satisfies min RR.
+        """
+        buffer = max(
+            atr * cfg.get("stop_atr_buffer", 0.35),
+            current * cfg.get("min_stop_pct", 0.2) / 100.0,
+        )
+        target_level = cfg.get("pullback_take_profit_retracement", 0.236)
+        min_rr = cfg.get("min_rr", 1.2)
+
         if direction == "LONG":
-            stop = min(swing.start_price, current) - buffer
-            tp = max(swing.end_price, current + (current - stop) * cfg.get("fallback_rr", 1.5))
+            stop_base = self._long_stop_base(swing, zone.level, cfg)
+            stop = stop_base - buffer
+            tp = self._retracement_price(swing, target_level)
+            if self._risk_reward(current, stop, tp, direction) < min_rr:
+                tp = current + (current - stop) * min_rr
+                if tp > swing.end_price:
+                    return current, stop, 0.0
         else:
-            stop = max(swing.start_price, current) + buffer
-            tp = min(swing.end_price, current - (stop - current) * cfg.get("fallback_rr", 1.5))
+            stop_base = self._short_stop_base(swing, zone.level, cfg)
+            stop = stop_base + buffer
+            tp = self._retracement_price(swing, target_level)
+            if self._risk_reward(current, stop, tp, direction) < min_rr:
+                tp = current - (stop - current) * min_rr
+                if tp < swing.end_price:
+                    return current, stop, 0.0
         return current, stop, tp
+
+    def _long_stop_base(self, swing: Swing, entry_level: float, cfg: dict) -> float:
+        if entry_level <= 0.382:
+            return self._retracement_price(swing, cfg.get("shallow_entry_stop_level", 0.618))
+        return self._retracement_price(swing, cfg.get("deep_entry_stop_level", 0.786))
+
+    def _short_stop_base(self, swing: Swing, entry_level: float, cfg: dict) -> float:
+        if entry_level <= 0.382:
+            return self._retracement_price(swing, cfg.get("shallow_entry_stop_level", 0.618))
+        return self._retracement_price(swing, cfg.get("deep_entry_stop_level", 0.786))
+
+    def _risk_reward(self, entry: float, stop: float, tp: float, direction: str) -> float:
+        if direction == "LONG":
+            risk = entry - stop
+            reward = tp - entry
+        else:
+            risk = stop - entry
+            reward = entry - tp
+        if risk <= 0 or reward <= 0:
+            return 0.0
+        return reward / risk
 
     def _quality_tier(self, score: int) -> tuple[str, float]:
         scoring = self._cfg.scoring_config
