@@ -91,18 +91,21 @@ class Bot:
         # Initial coin scan
         logger.info("Running initial coin scan...")
         if self.client.is_rate_limited():
-            sleep_s = self.client.rate_limit_sleep_seconds()
-            logger.warning("Initial coin scan paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
-            await self._sleep_with_shutdown(sleep_s)
-            if balance <= 0:
-                try:
-                    balance = await self.client.get_balance()
-                    self.risk_manager.initialize(balance)
-                    logger.info("Risk manager balance refreshed after backoff: ${:.2f}", balance)
-                except Exception as e:
-                    logger.warning("Balance refresh after backoff failed: {}", e)
-            if not self.open_positions:
-                await self._recover_positions()
+            if self.config.market_data_mode == "websocket":
+                logger.warning("Initial REST scan skipped during Binance backoff; starting websocket path")
+            else:
+                sleep_s = self.client.rate_limit_sleep_seconds()
+                logger.warning("Initial coin scan paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
+                await self._sleep_with_shutdown(sleep_s)
+                if balance <= 0:
+                    try:
+                        balance = await self.client.get_balance()
+                        self.risk_manager.initialize(balance)
+                        logger.info("Risk manager balance refreshed after backoff: ${:.2f}", balance)
+                    except Exception as e:
+                        logger.warning("Balance refresh after backoff failed: {}", e)
+                if not self.open_positions:
+                    await self._recover_positions()
         active_coins: list[str] = []
         while self.is_running and not active_coins:
             active_coins = await self.screener.scan()
@@ -1928,6 +1931,64 @@ class Bot:
 
         except Exception as e:
             logger.warning("Position recovery failed: {}", e)
+            if self.config.market_data_mode == "websocket" and self.client.is_rate_limited():
+                self._recover_positions_from_db_fallback()
+
+    def _recover_positions_from_db_fallback(self) -> None:
+        """Recover DB-known open trades when Binance REST is temporarily banned.
+
+        This is a temporary safety state for websocket monitoring/backoff periods.
+        Exchange reconciliation will correct it after REST becomes available.
+        """
+        if self.open_positions:
+            return
+        recovered = 0
+        try:
+            for row in self.db.get_open_trades():
+                if row.get("status") != "OPEN":
+                    continue
+                try:
+                    metadata = json.loads(row.get("metadata") or "{}")
+                except Exception:
+                    metadata = {}
+
+                signal = Signal(
+                    symbol=str(row.get("symbol") or ""),
+                    direction=str(row.get("direction") or "LONG"),
+                    entry_price=float(row.get("entry_price") or 0),
+                    stop_loss=float(row.get("stop_loss") or 0),
+                    take_profit=float(row.get("take_profit") or 0),
+                    confluence_score=int(row.get("confluence_score") or 0),
+                    quality=str(row.get("quality") or "RECOVERED"),
+                    regime=str(row.get("regime") or "UNKNOWN"),
+                    timestamp=int(time.time() * 1000),
+                    metadata=metadata,
+                )
+                if not signal.symbol or signal.entry_price <= 0:
+                    continue
+
+                trade = Trade(
+                    id=str(row.get("id") or ""),
+                    signal=signal,
+                    status="OPEN",
+                    entry_order_id=str(row.get("entry_order_id") or ""),
+                    stop_order_id=str(row.get("stop_order_id") or ""),
+                    tp_order_id=str(row.get("tp_order_id") or ""),
+                    entry_fill_price=signal.entry_price,
+                    position_size=float(row.get("position_size") or 0),
+                    margin_used=float(row.get("margin_used") or 0),
+                    leverage=int(row.get("leverage") or self.config.base_leverage),
+                    opened_at=int(row.get("opened_at") or int(time.time() * 1000)),
+                )
+                self.open_positions.append(PositionState(trade=trade))
+                self.risk_manager.add_open_position(trade)
+                recovered += 1
+        except Exception as db_e:
+            logger.warning("DB fallback recovery failed: {}", db_e)
+            return
+
+        if recovered:
+            logger.warning("Recovered {} DB open trades during Binance backoff", recovered)
 
     async def _cancel_orphan_entry_orders(self) -> None:
         """Cancel regular non-reduce-only entry orders left across restarts.
