@@ -155,6 +155,16 @@ class Config:
     def whitelist(self) -> list[str]:
         return self.get("screening", "whitelist", default=["BTCUSDT", "ETHUSDT"])
 
+    # ── Market Data ───────────────────────────────────────
+
+    @property
+    def market_data_config(self) -> dict:
+        return self.get("market_data", default={})
+
+    @property
+    def market_data_mode(self) -> str:
+        return str(self.get("market_data", "mode", default="rest")).lower()
+
     # ── Execution ──────────────────────────────────────────
 
     @property

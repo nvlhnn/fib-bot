@@ -141,6 +141,14 @@ class BinanceClient:
         """Convert a raw Binance symbol to ccxt unified symbol."""
         return self._raw_to_unified.get(raw_symbol)
 
+    def unified_to_raw(self, unified_symbol: str) -> str | None:
+        """Convert a CCXT unified symbol to raw Binance symbol."""
+        if not self._exchange:
+            return None
+        market = self._exchange.markets.get(unified_symbol)
+        raw_id = market.get("id", "") if market else ""
+        return raw_id or None
+
     async def close(self) -> None:
         """Close exchange connection."""
         if self._exchange:

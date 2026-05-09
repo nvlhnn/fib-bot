@@ -152,6 +152,26 @@ screening:
     - "ETHUSDT"
 
 # ──────────────────────────────────────────────────────────
+# MARKET DATA
+# ──────────────────────────────────────────────────────────
+market_data:
+  # Phase 2 adds websocket candle infrastructure behind this flag. The bot still
+  # uses REST candles until Phase 3/4 wiring is complete.
+  mode: "rest"  # rest | websocket
+
+  websocket:
+    enabled: false
+    timeframes: ["5m", "15m", "1h"]
+    max_streams_per_connection: 50
+    reconnect_base_delay_seconds: 5
+    reconnect_max_delay_seconds: 120
+
+  rest_bootstrap:
+    batch_size: 2
+    delay_seconds: 1.5
+    cooldown_after_418_minutes: 10
+
+# ──────────────────────────────────────────────────────────
 # ENTRY & EXIT
 # ──────────────────────────────────────────────────────────
 execution:
