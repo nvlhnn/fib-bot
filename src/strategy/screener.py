@@ -147,6 +147,13 @@ class CoinScanner:
         # Fetch candles in small batches to avoid Binance testnet IP bans.
         batch_size = 3
         for i in range(0, len(volume_filtered), batch_size):
+            if self._client.is_rate_limited():
+                logger.warning(
+                    "Scanner: ATR pass stopped after {}/{} candidates due Binance backoff",
+                    i, len(volume_filtered),
+                )
+                break
+
             batch = volume_filtered[i:i + batch_size]
             tasks = [
                 self._fetch_atr_pct(coin["symbol"])  # unified symbol
@@ -171,6 +178,9 @@ class CoinScanner:
 
             # Delay between batches; testnet bans shared IPs aggressively.
             if i + batch_size < len(volume_filtered):
+                if self._client.is_rate_limited():
+                    logger.warning("Scanner: ATR pass stopped before next batch due Binance backoff")
+                    break
                 await asyncio.sleep(1.0)
 
         if not scored:
