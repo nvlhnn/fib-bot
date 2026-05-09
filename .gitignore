@@ -29,3 +29,6 @@ Thumbs.db
 
 # Backtest reports
 backtest/reports/
+
+# Runtime state
+data/*.json
