@@ -218,7 +218,7 @@ class Bot:
         for pos in self.open_positions:
             if pos.trade.signal:
                 symbols.append(pos.trade.signal.symbol)
-        for trade in self.pending_entries.values():
+        for trade in self.pending_entries:
             if trade.signal:
                 symbols.append(trade.signal.symbol)
         return list(dict.fromkeys(symbols))
