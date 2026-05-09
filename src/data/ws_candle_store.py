@@ -101,6 +101,65 @@ class WebSocketCandleStore:
         async with self._lock:
             self._candles[symbol][timeframe] = deque(candles[-max_len:], maxlen=max_len)
 
+    async def bootstrap_history(
+        self,
+        symbols: list[str],
+        timeframes: list[str],
+        *,
+        batch_size: int = 2,
+        delay_seconds: float = 1.5,
+        stop_on_rate_limit: bool = True,
+    ) -> dict[str, dict[str, int]]:
+        """Seed candle history via slow REST bootstrap.
+
+        This is the only planned REST candle use in websocket mode. It runs
+        sequentially/small-batch and stops as soon as Binance backoff is active
+        so startup does not extend testnet IP bans.
+
+        Returns: {symbol: {timeframe: candle_count}}
+        """
+        results: dict[str, dict[str, int]] = {}
+        jobs = [(symbol, tf) for symbol in symbols for tf in timeframes]
+        batch_size = max(1, batch_size)
+
+        for i in range(0, len(jobs), batch_size):
+            if stop_on_rate_limit and self._client.is_rate_limited():
+                logger.warning("WebSocketCandleStore bootstrap paused by Binance rate-limit backoff")
+                break
+
+            batch = jobs[i:i + batch_size]
+            fetched = await asyncio.gather(
+                *(self._bootstrap_one(symbol, timeframe) for symbol, timeframe in batch),
+                return_exceptions=True,
+            )
+
+            for (symbol, timeframe), count in zip(batch, fetched):
+                if isinstance(count, Exception):
+                    logger.warning("Bootstrap failed for {} {}: {}", symbol, timeframe, count)
+                    count = 0
+                results.setdefault(symbol, {})[timeframe] = int(count or 0)
+
+            if stop_on_rate_limit and self._client.is_rate_limited():
+                logger.warning("WebSocketCandleStore bootstrap stopped after rate-limit detection")
+                break
+
+            if i + batch_size < len(jobs):
+                await asyncio.sleep(delay_seconds)
+
+        ready = len(self.ready_symbols(timeframes))
+        logger.info(
+            "WebSocketCandleStore bootstrap complete: ready_symbols={}/{}",
+            ready, len(symbols),
+        )
+        return results
+
+    async def _bootstrap_one(self, symbol: str, timeframe: str) -> int:
+        limit = self._max_history.get(timeframe, 200)
+        candles = await self._client.fetch_candles(symbol, timeframe, limit=limit)
+        if candles:
+            await self.seed(symbol, timeframe, candles)
+        return len(candles)
+
     def get(self, symbol: str) -> dict[str, list[Candle]]:
         """Return a copy of candle history for one symbol."""
         data = self._candles.get(symbol, {})

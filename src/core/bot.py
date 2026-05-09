@@ -19,6 +19,7 @@ from loguru import logger
 from src.core.config import Config
 from src.data.candle_cache import CandleCache
 from src.data.models import PositionState, Signal, Trade
+from src.data.ws_candle_store import WebSocketCandleStore
 from src.database.db import Database
 from src.exchange.binance_client import BinanceClient
 from src.notifications.telegram import TelegramNotifier
@@ -48,6 +49,7 @@ class Bot:
         self.indicator_engine = IndicatorEngine(config)
         self.strategy = FibonacciScorer(config)
         self.candle_cache = CandleCache()
+        self.ws_candle_store: WebSocketCandleStore | None = None
 
         # Position tracking
         self.open_positions: list[PositionState] = []
@@ -113,6 +115,8 @@ class Bot:
             await self._sleep_with_shutdown(sleep_s)
         logger.info("Active coins ({}): {}", len(active_coins), active_coins)
 
+        await self._start_market_data(active_coins)
+
         # Start trading loops immediately. Startup scan logging / Telegram must
         # never block position monitoring or DCA protection.
 
@@ -159,9 +163,47 @@ class Bot:
         """Graceful shutdown."""
         self.is_running = False
         logger.info("Shutting down...")
+        if self.ws_candle_store:
+            await self.ws_candle_store.stop()
         await self.client.close()
         self.db.close()
         logger.info("Bot stopped.")
+
+    async def _start_market_data(self, active_coins: list[str]) -> None:
+        """Start optional websocket candle infrastructure.
+
+        Phase 3 only bootstraps and starts the store behind config. The signal
+        loop still reads REST CandleCache until Phase 4 swaps it over.
+        """
+        md_cfg = self.config.market_data_config
+        ws_cfg = md_cfg.get("websocket", {}) or {}
+        if self.config.market_data_mode != "websocket" or not ws_cfg.get("enabled", False):
+            return
+        if not active_coins:
+            logger.warning("Websocket market data requested but active coin list is empty")
+            return
+
+        timeframes = list(ws_cfg.get("timeframes") or ["5m", "15m", "1h"])
+        self.ws_candle_store = WebSocketCandleStore(
+            self.client,
+            max_streams_per_connection=int(ws_cfg.get("max_streams_per_connection", 50)),
+            reconnect_base_delay_seconds=float(ws_cfg.get("reconnect_base_delay_seconds", 5)),
+            reconnect_max_delay_seconds=float(ws_cfg.get("reconnect_max_delay_seconds", 120)),
+        )
+
+        bootstrap_cfg = md_cfg.get("rest_bootstrap", {}) or {}
+        await self.ws_candle_store.bootstrap_history(
+            active_coins,
+            timeframes,
+            batch_size=int(bootstrap_cfg.get("batch_size", 2)),
+            delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
+        )
+        if self.client.is_rate_limited():
+            await self._sleep_for_rate_limit("Websocket market data startup")
+        if not self.is_running:
+            return
+
+        await self.ws_candle_store.start(active_coins, timeframes)
 
     async def _sleep_with_shutdown(self, seconds: float, step: float = 1.0) -> None:
         """Sleep in short chunks so systemd stop/SIGTERM can exit quickly."""
