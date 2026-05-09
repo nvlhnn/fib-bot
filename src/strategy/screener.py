@@ -127,11 +127,15 @@ class CoinScanner:
 
         logger.info("Scanner: {} passed volume/spread filter", len(volume_filtered))
 
-        # ATR candles are the expensive part. Cap this pass to the most liquid
-        # candidates so testnet does not ban the shared server IP.
+        rest_atr_prefilter_enabled = bool(dyn_cfg.get("rest_atr_prefilter_enabled", True))
+        use_rest_atr_prefilter = self._cfg.market_data_mode != "websocket" or rest_atr_prefilter_enabled
+
+        # ATR candles are the expensive part. Only cap candidates by
+        # atr_scan_limit when REST ATR prefiltering is actually enabled. In
+        # websocket mode with REST ATR disabled, max_active_coins is the cap.
         atr_scan_limit = int(dyn_cfg.get("atr_scan_limit", max_coins * 4))
         volume_filtered.sort(key=lambda c: c["volume_24h"], reverse=True)
-        if len(volume_filtered) > atr_scan_limit:
+        if use_rest_atr_prefilter and len(volume_filtered) > atr_scan_limit:
             logger.info(
                 "Scanner: ATR prefilter — checking top {} by volume (from {})",
                 atr_scan_limit, len(volume_filtered),
@@ -144,10 +148,7 @@ class CoinScanner:
 
         scored: list[CoinScore] = []
 
-        if (
-            self._cfg.market_data_mode == "websocket"
-            and not dyn_cfg.get("rest_atr_prefilter_enabled", False)
-        ):
+        if not use_rest_atr_prefilter:
             logger.info(
                 "Scanner: REST ATR prefilter disabled in websocket mode; ranking by volume/spread only"
             )
