@@ -1944,7 +1944,15 @@ class Bot:
             return
         recovered = 0
         try:
-            for row in self.db.get_open_trades():
+            rows = [row for row in self.db.get_open_trades() if row.get("status") == "OPEN"]
+            rows.sort(key=lambda r: int(r.get("opened_at") or 0), reverse=True)
+            if len(rows) > 1:
+                logger.warning(
+                    "DB fallback found {} OPEN trades; recovering latest only until exchange confirms state",
+                    len(rows),
+                )
+
+            for row in rows[:1]:
                 if row.get("status") != "OPEN":
                     continue
                 try:
