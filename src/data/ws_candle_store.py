@@ -43,8 +43,11 @@ class WebSocketCandleStore:
         self._reconnect_max_delay = reconnect_max_delay_seconds
 
         self._candles: dict[str, dict[str, deque[Candle]]] = defaultdict(dict)
+        self._prices: dict[str, float] = {}
         self._symbols: list[str] = []
         self._timeframes: list[str] = []
+        self._include_mark_price = False
+        self._mark_price_interval = "1s"
         self._raw_to_unified: dict[str, str] = {}
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -59,13 +62,27 @@ class WebSocketCandleStore:
     def last_event_ts(self) -> float:
         return self._last_event_ts
 
-    async def start(self, symbols: list[str], timeframes: list[str]) -> None:
+    async def start(
+        self,
+        symbols: list[str],
+        timeframes: list[str],
+        *,
+        include_mark_price: bool = False,
+        mark_price_interval: str = "1s",
+    ) -> None:
         """Start websocket workers for symbols/timeframes."""
         await self.stop()
         self._symbols = list(dict.fromkeys(symbols))
         self._timeframes = list(dict.fromkeys(timeframes))
+        self._include_mark_price = include_mark_price
+        self._mark_price_interval = mark_price_interval
         self._raw_to_unified = self._build_raw_map(self._symbols)
-        streams = self._build_streams(self._symbols, self._timeframes)
+        streams = self._build_streams(
+            self._symbols,
+            self._timeframes,
+            include_mark_price=include_mark_price,
+            mark_price_interval=mark_price_interval,
+        )
         if not streams:
             logger.warning("WebSocketCandleStore: no streams to start")
             return
@@ -74,8 +91,8 @@ class WebSocketCandleStore:
         for chunk in self._chunks(streams, self._max_streams_per_connection):
             self._tasks.append(asyncio.create_task(self._run_connection(chunk)))
         logger.info(
-            "WebSocketCandleStore started: symbols={} timeframes={} streams={} connections={}",
-            len(self._symbols), self._timeframes, len(streams), len(self._tasks),
+            "WebSocketCandleStore started: symbols={} timeframes={} mark_price={} streams={} connections={}",
+            len(self._symbols), self._timeframes, include_mark_price, len(streams), len(self._tasks),
         )
 
     async def stop(self) -> None:
@@ -93,7 +110,12 @@ class WebSocketCandleStore:
         unique = list(dict.fromkeys(symbols))
         if unique == self._symbols:
             return
-        await self.start(unique, self._timeframes)
+        await self.start(
+            unique,
+            self._timeframes,
+            include_mark_price=self._include_mark_price,
+            mark_price_interval=self._mark_price_interval,
+        )
 
     async def seed(self, symbol: str, timeframe: str, candles: list[Candle]) -> None:
         """Seed history from REST bootstrap before websocket updates arrive."""
@@ -165,6 +187,10 @@ class WebSocketCandleStore:
         data = self._candles.get(symbol, {})
         return {tf: list(candles) for tf, candles in data.items()}
 
+    def get_price(self, symbol: str) -> float | None:
+        """Return latest websocket mark price for symbol, if available."""
+        return self._prices.get(symbol)
+
     def snapshot(self, symbols: list[str] | None = None) -> dict[str, dict[str, list[Candle]]]:
         """Return a copy of candle history for selected/all symbols."""
         selected = symbols or list(self._candles.keys())
@@ -187,7 +213,14 @@ class WebSocketCandleStore:
                 raw_to_unified[raw.upper()] = unified
         return raw_to_unified
 
-    def _build_streams(self, symbols: list[str], timeframes: list[str]) -> list[str]:
+    def _build_streams(
+        self,
+        symbols: list[str],
+        timeframes: list[str],
+        *,
+        include_mark_price: bool = False,
+        mark_price_interval: str = "1s",
+    ) -> list[str]:
         streams: list[str] = []
         for unified in symbols:
             raw = self._client.unified_to_raw(unified)
@@ -196,6 +229,9 @@ class WebSocketCandleStore:
                 continue
             for tf in timeframes:
                 streams.append(f"{raw.lower()}@kline_{tf}")
+            if include_mark_price:
+                suffix = "@1s" if mark_price_interval == "1s" else ""
+                streams.append(f"{raw.lower()}@markPrice{suffix}")
         return streams
 
     @staticmethod
@@ -229,6 +265,15 @@ class WebSocketCandleStore:
         try:
             payload: dict[str, Any] = json.loads(message)
             data = payload.get("data", payload)
+            event_type = data.get("e")
+            if event_type == "markPriceUpdate":
+                raw_symbol = str(data.get("s", "")).upper()
+                symbol = self._raw_to_unified.get(raw_symbol)
+                if symbol:
+                    self._prices[symbol] = float(data.get("p") or 0)
+                    self._last_event_ts = time.time()
+                return
+
             kline = data.get("k", {})
             if not kline or not kline.get("x"):
                 return

@@ -58,6 +58,7 @@ class Bot:
         # Timing
         self._last_heartbeat = 0.0
         self._heartbeat_interval = 3600  # 1 hour
+        self._last_position_reconcile = 0.0
 
     # ── Lifecycle ──────────────────────────────────────────
 
@@ -203,7 +204,12 @@ class Bot:
         if not self.is_running:
             return
 
-        await self.ws_candle_store.start(active_coins, timeframes)
+        await self.ws_candle_store.start(
+            active_coins,
+            timeframes,
+            include_mark_price=bool(ws_cfg.get("mark_price_enabled", True)),
+            mark_price_interval=str(ws_cfg.get("mark_price_interval", "1s")),
+        )
 
     async def _sleep_with_shutdown(self, seconds: float, step: float = 1.0) -> None:
         """Sleep in short chunks so systemd stop/SIGTERM can exit quickly."""
@@ -476,12 +482,17 @@ class Bot:
                     await self._sleep_for_rate_limit("Position monitor")
                     continue
 
-                # First reconcile parent positions. If a 0.5 parent has already
-                # closed by TP/SL/manual, cancel its still-resting 0.618 DCA
-                # before checking pending entries, so the DCA cannot become a
-                # standalone trade after the idea is finished.
-                await self._sync_open_positions_with_exchange()
-                await self._cancel_orphan_dca_entries()
+                # Reconcile exchange state periodically instead of every 30s.
+                # Order/position truth remains REST, but websocket mark prices
+                # handle normal PnL/exit monitoring between reconciliations.
+                if self._should_reconcile_positions():
+                    # First reconcile parent positions. If a 0.5 parent has already
+                    # closed by TP/SL/manual, cancel its still-resting 0.618 DCA
+                    # before checking pending entries, so the DCA cannot become a
+                    # standalone trade after the idea is finished.
+                    await self._sync_open_positions_with_exchange()
+                    await self._cancel_orphan_dca_entries()
+                    self._last_position_reconcile = time.time()
 
                 # Then check pending entry fills.
                 await self._check_pending_entries()
@@ -496,11 +507,8 @@ class Bot:
                     if not signal:
                         continue
 
-                    # Fetch current price
-                    try:
-                        ticker = await self.client.fetch_ticker(signal.symbol)
-                        current_price = float(ticker.get("last", 0))
-                    except Exception:
+                    current_price = await self._get_monitor_price(signal.symbol)
+                    if current_price <= 0:
                         continue
 
                     pos.current_price = current_price
@@ -541,6 +549,30 @@ class Bot:
             except Exception as e:
                 logger.error("Tier 3 error: {}", e)
                 await self._sleep_with_shutdown(5)
+
+    def _should_reconcile_positions(self) -> bool:
+        if self.pending_entries:
+            return True
+        interval = float(
+            self.config.market_data_config
+            .get("position_monitor", {})
+            .get("reconcile_interval_seconds", 300)
+        )
+        return time.time() - self._last_position_reconcile >= max(30.0, interval)
+
+    async def _get_monitor_price(self, symbol: str) -> float:
+        if self.config.market_data_mode == "websocket" and self.ws_candle_store:
+            price = self.ws_candle_store.get_price(symbol)
+            if price and price > 0:
+                return float(price)
+
+        if self.client.is_rate_limited():
+            return 0.0
+        try:
+            ticker = await self.client.fetch_ticker(symbol)
+            return float(ticker.get("last", 0) or 0)
+        except Exception:
+            return 0.0
 
     def _portfolio_take_profit_config(self) -> dict:
         """Portfolio-level TP config for closing all managed positions."""

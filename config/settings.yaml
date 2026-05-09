@@ -162,9 +162,14 @@ market_data:
   websocket:
     enabled: true
     timeframes: ["5m", "15m", "1h"]
+    mark_price_enabled: true
+    mark_price_interval: "1s"
     max_streams_per_connection: 50
     reconnect_base_delay_seconds: 5
     reconnect_max_delay_seconds: 120
+
+  position_monitor:
+    reconcile_interval_seconds: 300
 
   rest_bootstrap:
     batch_size: 2
