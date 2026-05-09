@@ -144,44 +144,61 @@ class CoinScanner:
 
         scored: list[CoinScore] = []
 
-        # Fetch candles in small batches to avoid Binance testnet IP bans.
-        batch_size = 3
-        for i in range(0, len(volume_filtered), batch_size):
-            if self._client.is_rate_limited():
-                logger.warning(
-                    "Scanner: ATR pass stopped after {}/{} candidates due Binance backoff",
-                    i, len(volume_filtered),
-                )
-                break
-
-            batch = volume_filtered[i:i + batch_size]
-            tasks = [
-                self._fetch_atr_pct(coin["symbol"])  # unified symbol
-                for coin in batch
-            ]
-            atr_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for coin, atr_pct in zip(batch, atr_results):
-                if isinstance(atr_pct, Exception):
-                    continue
-                if atr_pct < min_atr or atr_pct > max_atr:
-                    continue
-
+        if (
+            self._cfg.market_data_mode == "websocket"
+            and not dyn_cfg.get("rest_atr_prefilter_enabled", False)
+        ):
+            logger.info(
+                "Scanner: REST ATR prefilter disabled in websocket mode; ranking by volume/spread only"
+            )
+            for coin in volume_filtered:
                 scored.append(CoinScore(
-                    symbol=coin["symbol"],  # unified CCXT symbol
-                    score=0.0,  # Calculated next
+                    symbol=coin["symbol"],
+                    score=0.0,
                     volume_24h=coin["volume_24h"],
-                    atr_pct=atr_pct,
+                    atr_pct=min_atr,
                     spread_pct=coin["spread_pct"],
                     price=coin["price"],
                 ))
-
-            # Delay between batches; testnet bans shared IPs aggressively.
-            if i + batch_size < len(volume_filtered):
+        else:
+            # Fetch candles in small batches to avoid Binance testnet IP bans.
+            batch_size = 3
+            for i in range(0, len(volume_filtered), batch_size):
                 if self._client.is_rate_limited():
-                    logger.warning("Scanner: ATR pass stopped before next batch due Binance backoff")
+                    logger.warning(
+                        "Scanner: ATR pass stopped after {}/{} candidates due Binance backoff",
+                        i, len(volume_filtered),
+                    )
                     break
-                await asyncio.sleep(1.0)
+
+                batch = volume_filtered[i:i + batch_size]
+                tasks = [
+                    self._fetch_atr_pct(coin["symbol"])  # unified symbol
+                    for coin in batch
+                ]
+                atr_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for coin, atr_pct in zip(batch, atr_results):
+                    if isinstance(atr_pct, Exception):
+                        continue
+                    if atr_pct < min_atr or atr_pct > max_atr:
+                        continue
+
+                    scored.append(CoinScore(
+                        symbol=coin["symbol"],  # unified CCXT symbol
+                        score=0.0,  # Calculated next
+                        volume_24h=coin["volume_24h"],
+                        atr_pct=atr_pct,
+                        spread_pct=coin["spread_pct"],
+                        price=coin["price"],
+                    ))
+
+                # Delay between batches; testnet bans shared IPs aggressively.
+                if i + batch_size < len(volume_filtered):
+                    if self._client.is_rate_limited():
+                        logger.warning("Scanner: ATR pass stopped before next batch due Binance backoff")
+                        break
+                    await asyncio.sleep(1.0)
 
         if not scored:
             logger.warning("Scanner: no coins passed all filters!")

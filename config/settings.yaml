@@ -126,6 +126,7 @@ screening:
     rescreen_interval_hours: 4
     max_active_coins: 30
     atr_scan_limit: 20
+    rest_atr_prefilter_enabled: false
 
     filters:
       min_24h_volume: 50000000
