@@ -219,6 +219,15 @@ class Database:
             )
             return [dict(row) for row in cur.fetchall()]
 
+    def get_recent_trades(self, symbol: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Get recent trades for one symbol."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM trades WHERE symbol = ? ORDER BY opened_at DESC LIMIT ?",
+                (symbol, limit),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
     # ── Signal Logging ─────────────────────────────────────
 
     def log_signal(

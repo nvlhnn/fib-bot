@@ -41,8 +41,17 @@ class CoinScanner:
         whitelist_raw = set(screening_cfg.get("whitelist", []))
         max_coins = dyn_cfg.get("max_active_coins", 30)
 
+        if self._client.is_rate_limited():
+            logger.warning("Scanner skipped during Binance rate-limit backoff")
+            return self.active_coins
+
         # ── Step 1: Fetch all available futures pairs ──
-        exchange_info = await self._client.fetch_exchange_info()
+        try:
+            exchange_info = await self._client.fetch_exchange_info()
+            tickers = await self._client.fetch_all_tickers()
+        except Exception as e:
+            logger.warning("Scanner API fetch skipped/failed: {}", e)
+            return self.active_coins
         all_symbols_info = exchange_info.get("symbols", [])
 
         contract_type = filters.get("contract_type", "PERPETUAL")
@@ -67,9 +76,6 @@ class CoinScanner:
         for raw in whitelist_raw:
             uni = self._client.raw_to_unified(raw)
             whitelist.add(uni if uni else raw)
-
-        # ── Step 2: Fetch tickers (one batch call) ──
-        tickers = await self._client.fetch_all_tickers()
 
         # Build reverse map: raw symbol (e.g. BTCUSDT) → ticker data
         # ccxt fetch_tickers() keys by unified symbol (e.g. BTC/USDT:USDT),
@@ -121,14 +127,25 @@ class CoinScanner:
 
         logger.info("Scanner: {} passed volume/spread filter", len(volume_filtered))
 
+        # ATR candles are the expensive part. Cap this pass to the most liquid
+        # candidates so testnet does not ban the shared server IP.
+        atr_scan_limit = int(dyn_cfg.get("atr_scan_limit", max_coins * 4))
+        volume_filtered.sort(key=lambda c: c["volume_24h"], reverse=True)
+        if len(volume_filtered) > atr_scan_limit:
+            logger.info(
+                "Scanner: ATR prefilter — checking top {} by volume (from {})",
+                atr_scan_limit, len(volume_filtered),
+            )
+            volume_filtered = volume_filtered[:atr_scan_limit]
+
         # ── Step 4: Calculate ATR% for filtered coins ──
         min_atr = filters.get("min_atr_pct", 0.15)
         max_atr = filters.get("max_atr_pct", 5.0)
 
         scored: list[CoinScore] = []
 
-        # Fetch candles in batches to avoid rate limits
-        batch_size = 10
+        # Fetch candles in small batches to avoid Binance testnet IP bans.
+        batch_size = 3
         for i in range(0, len(volume_filtered), batch_size):
             batch = volume_filtered[i:i + batch_size]
             tasks = [
@@ -152,9 +169,9 @@ class CoinScanner:
                     price=coin["price"],
                 ))
 
-            # Small delay between batches
+            # Delay between batches; testnet bans shared IPs aggressively.
             if i + batch_size < len(volume_filtered):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
 
         if not scored:
             logger.warning("Scanner: no coins passed all filters!")

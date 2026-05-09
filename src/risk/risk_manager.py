@@ -53,10 +53,14 @@ class RiskManager:
         if not ok:
             return False, reason
 
-        # 2. Position limits
-        ok, reason = self._check_position_limits()
-        if not ok:
-            return False, reason
+        dca_candidate = any(self._is_allowed_dca(pos, signal) for pos in self._open_positions)
+
+        # 2. Position limits. DCA merges into an existing net exchange position,
+        # so it should not consume a new open-position slot.
+        if not dca_candidate:
+            ok, reason = self._check_position_limits()
+            if not ok:
+                return False, reason
 
         # 3. Daily trade limit (0 or lower = unlimited)
         max_daily_trades = self._cfg.max_daily_trades
@@ -65,17 +69,65 @@ class RiskManager:
             if trade_count >= max_daily_trades:
                 return False, f"Daily trade limit ({max_daily_trades}) reached"
 
-        # 4. Duplicate symbol check
+        # 4. Duplicate symbol check (except controlled Fib DCA)
         for pos in self._open_positions:
             if pos.signal and pos.signal.symbol == signal.symbol:
+                if self._is_allowed_dca(pos, signal):
+                    continue
                 return False, f"Already have position in {signal.symbol}"
 
         # 5. Correlation check
-        ok, reason = self._check_correlation(signal)
-        if not ok:
-            return False, reason
+        if not dca_candidate:
+            ok, reason = self._check_correlation(signal)
+            if not ok:
+                return False, reason
 
         return True, "OK"
+
+    def _is_allowed_dca(self, existing: Trade, signal: Signal) -> bool:
+        """Allow one controlled Fib DCA: existing 0.5 leg → new 0.618 leg."""
+        if not existing.signal:
+            return False
+
+        cfg = self._cfg.get("strategy", "fibonacci", default={})
+        if not cfg.get("dca_enabled", False):
+            return False
+        if existing.signal.direction != signal.direction:
+            return False
+
+        old_meta = existing.signal.metadata or {}
+        new_meta = signal.metadata or {}
+        old_zone = old_meta.get("fib_zone", {}) or {}
+        new_zone = new_meta.get("fib_zone", {}) or {}
+        old_swing = old_meta.get("swing", {}) or {}
+        new_swing = new_meta.get("swing", {}) or {}
+
+        try:
+            old_level = round(float(old_zone.get("level", -1)), 3)
+            new_level = round(float(new_zone.get("level", -1)), 3)
+            from_level = round(float(cfg.get("dca_from_level", 0.5)), 3)
+            to_level = round(float(cfg.get("dca_to_level", 0.618)), 3)
+            legs = int(old_meta.get("dca_legs", 1) or 1)
+            max_legs = int(cfg.get("dca_max_legs", 2) or 2)
+        except Exception:
+            return False
+
+        if legs >= max_legs:
+            return False
+        if old_level != from_level or new_level != to_level:
+            return False
+
+        return self._same_fib_swing(old_swing, new_swing)
+
+    def _same_fib_swing(self, current: dict, previous: dict) -> bool:
+        try:
+            return (
+                current.get("direction") == previous.get("direction")
+                and abs(float(current.get("start", 0)) - float(previous.get("start", 0))) < 1e-9
+                and abs(float(current.get("end", 0)) - float(previous.get("end", 0))) < 1e-9
+            )
+        except Exception:
+            return False
 
     def calculate_position_size(
         self,
@@ -234,7 +286,7 @@ class RiskManager:
     def _check_position_limits(self) -> tuple[bool, str]:
         """Check position count limits."""
         max_pos = self._cfg.max_open_positions
-        if len(self._open_positions) >= max_pos:
+        if max_pos > 0 and len(self._open_positions) >= max_pos:
             return False, f"Max positions ({max_pos}) reached"
         return True, "OK"
 

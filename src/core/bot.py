@@ -9,6 +9,8 @@ Tier 3: Position Monitor — every 30 seconds (when positions open)
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import time
 from datetime import datetime, timezone
 
@@ -68,8 +70,14 @@ class Bot:
         await self.client.connect()
         await self.notifier.initialize()
 
-        # Initialize risk manager
-        balance = await self.client.get_balance()
+        # Initialize risk manager. If testnet is currently 418-banned, do not
+        # crash/restart-loop and make the ban worse; use a temporary DB/zero
+        # balance and let the normal backoff pause API work until it expires.
+        try:
+            balance = await self.client.get_balance()
+        except Exception as e:
+            logger.warning("Risk balance check skipped during rate-limit/backoff: {}", e)
+            balance = 0.0
         self.risk_manager.initialize(balance)
 
         # Recover open positions from exchange
@@ -77,27 +85,62 @@ class Bot:
 
         # Initial coin scan
         logger.info("Running initial coin scan...")
-        active_coins = await self.screener.scan()
+        if self.client.is_rate_limited():
+            sleep_s = self.client.rate_limit_sleep_seconds(buffer_seconds=10)
+            logger.warning("Initial coin scan paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
+            await asyncio.sleep(sleep_s)
+            if balance <= 0:
+                try:
+                    balance = await self.client.get_balance()
+                    self.risk_manager.initialize(balance)
+                    logger.info("Risk manager balance refreshed after backoff: ${:.2f}", balance)
+                except Exception as e:
+                    logger.warning("Balance refresh after backoff failed: {}", e)
+            if not self.open_positions:
+                await self._recover_positions()
+        active_coins: list[str] = []
+        while self.is_running is False and not active_coins:
+            active_coins = await self.screener.scan()
+            if active_coins:
+                break
+            sleep_s = (
+                self.client.rate_limit_sleep_seconds(buffer_seconds=10)
+                if self.client.is_rate_limited()
+                else 60.0
+            )
+            logger.warning("Initial coin scan returned no coins; retrying in {:.0f}s", sleep_s)
+            await asyncio.sleep(sleep_s)
         logger.info("Active coins ({}): {}", len(active_coins), active_coins)
 
-        # Log scan to DB
-        scores = self.screener.get_scores()
-        self.db.log_scan(
-            selected_coins=active_coins,
-            scores={s: {"score": c.score, "atr": c.atr_pct, "vol": c.volume_24h}
-                    for s, c in scores.items()},
-            total_scanned=0,
-            passed_filter=len(active_coins),
-        )
-
-        # Notify
-        await self.notifier.bot_started(
-            mode=self.config.bot_mode,
-            balance=balance,
-            coins=len(active_coins),
-        )
-
+        # Start trading loops immediately. Startup scan logging / Telegram must
+        # never block position monitoring or DCA protection.
         self.is_running = True
+
+        async def _startup_side_effects() -> None:
+            try:
+                scores = self.screener.get_scores()
+                self.db.log_scan(
+                    selected_coins=active_coins,
+                    scores={s: {"score": c.score, "atr": c.atr_pct, "vol": c.volume_24h}
+                            for s, c in scores.items()},
+                    total_scanned=0,
+                    passed_filter=len(active_coins),
+                )
+            except Exception as e:
+                logger.warning("Initial scan log skipped: {}", e)
+            try:
+                await asyncio.wait_for(
+                    self.notifier.bot_started(
+                        mode=self.config.bot_mode,
+                        balance=balance,
+                        coins=len(active_coins),
+                    ),
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.warning("Bot-start notification skipped/timed out: {}", e)
+
+        asyncio.create_task(_startup_side_effects())
 
         # Run the 3-tier system
         try:
@@ -131,6 +174,12 @@ class Bot:
 
         while self.is_running:
             try:
+                if self.client.is_rate_limited():
+                    sleep_s = self.client.rate_limit_sleep_seconds(buffer_seconds=10)
+                    logger.warning("Tier 1 scanner paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
+                    await asyncio.sleep(sleep_s)
+                    continue
+
                 logger.info("━━━ TIER 1: Coin Scanner ━━━")
                 old_coins = set(self.screener.active_coins)
 
@@ -166,6 +215,12 @@ class Bot:
             try:
                 # Wait for next candle close
                 await self._wait_for_candle_close()
+
+                if self.client.is_rate_limited():
+                    sleep_s = self.client.rate_limit_sleep_seconds(buffer_seconds=10)
+                    logger.warning("Signal checker paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
+                    await asyncio.sleep(sleep_s)
+                    continue
 
                 active_coins = self.screener.active_coins
                 if not active_coins:
@@ -232,6 +287,16 @@ class Bot:
                 rejected_count = 0
                 failed_count = 0
                 for signal in all_signals:
+                    cooldown_reason = self._zone_cooldown_reason(signal)
+                    if cooldown_reason:
+                        rejected_count += 1
+                        logger.info(
+                            "  {} {} rejected: {}",
+                            signal.direction, signal.symbol, cooldown_reason,
+                        )
+                        self.db.log_signal(signal, taken=False, reason=cooldown_reason)
+                        continue
+
                     approved, reason = self.risk_manager.validate(signal)
 
                     if approved:
@@ -260,13 +325,88 @@ class Bot:
                 logger.error("Tier 2 error: {}", e)
                 await asyncio.sleep(10)
 
+    def _zone_cooldown_reason(self, signal: Signal) -> str:
+        """Prevent repeated entries on the same Fib zone after it closes.
+
+        - Losing/SL-like closes block the same symbol + level + swing until the
+          swing changes.
+        - Winning closes only cool the same symbol + level + swing briefly.
+        This keeps broad scanner frequency high without re-buying the same
+        broken pullback every cycle.
+        """
+        meta = signal.metadata or {}
+        zone = meta.get("fib_zone", {}) or {}
+        swing = meta.get("swing", {}) or {}
+        level = zone.get("level")
+        if level is None or not swing:
+            return ""
+
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        win_cooldown_ms = int(cfg.get("zone_cooldown_minutes", 30)) * 60_000
+        loss_blocks = cfg.get("block_zone_after_loss", True)
+        now_ms = int(time.time() * 1000)
+
+        try:
+            recent = self.db.get_recent_trades(signal.symbol, limit=30)
+        except Exception as e:
+            logger.warning("Could not read zone cooldown history for {}: {}", signal.symbol, e)
+            return ""
+
+        for trade in recent:
+            if trade.get("status") != "CLOSED":
+                continue
+            try:
+                old_meta = json.loads(trade.get("metadata") or "{}")
+            except Exception:
+                continue
+            old_zone = old_meta.get("fib_zone", {}) or {}
+            old_swing = old_meta.get("swing", {}) or {}
+            if round(float(old_zone.get("level", -1)), 3) != round(float(level), 3):
+                continue
+            if not self._same_fib_swing(swing, old_swing):
+                continue
+
+            net = float(trade.get("net_pnl") or 0)
+            if net < 0 and loss_blocks:
+                return f"Zone blocked after loss: {signal.symbol} {zone.get('name')} same swing"
+
+            closed_at = int(trade.get("closed_at") or 0)
+            if closed_at and now_ms - closed_at < win_cooldown_ms:
+                remaining = int((win_cooldown_ms - (now_ms - closed_at)) / 60_000) + 1
+                return f"Zone cooldown: {signal.symbol} {zone.get('name')} {remaining}m remaining"
+
+        return ""
+
+    def _same_fib_swing(self, current: dict, previous: dict) -> bool:
+        try:
+            return (
+                current.get("direction") == previous.get("direction")
+                and abs(float(current.get("start", 0)) - float(previous.get("start", 0))) < 1e-9
+                and abs(float(current.get("end", 0)) - float(previous.get("end", 0))) < 1e-9
+            )
+        except Exception:
+            return False
+
     # ── Tier 3: Position Monitor ──────────────────────────
 
     async def _tier3_position_monitor(self) -> None:
         """Monitor pending entries and open positions every 30 seconds."""
         while self.is_running:
             try:
-                # Check pending entry fills first
+                if self.client.is_rate_limited():
+                    sleep_s = min(60.0, self.client.rate_limit_sleep_seconds(buffer_seconds=10))
+                    logger.warning("Position monitor paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
+                    await asyncio.sleep(sleep_s)
+                    continue
+
+                # First reconcile parent positions. If a 0.5 parent has already
+                # closed by TP/SL/manual, cancel its still-resting 0.618 DCA
+                # before checking pending entries, so the DCA cannot become a
+                # standalone trade after the idea is finished.
+                await self._sync_open_positions_with_exchange()
+                await self._cancel_orphan_dca_entries()
+
+                # Then check pending entry fills.
                 await self._check_pending_entries()
 
                 if not self.open_positions:
@@ -313,14 +453,371 @@ class Bot:
                                 (trade.entry_fill_price - current_price) / stop_dist
                             )
 
-                    # ── Exit management ──
+                    # ── DCA from original Fib swing, then exit management ──
+                    await self._maybe_dca_from_monitor(pos)
                     await self._manage_exit(pos)
+
+                await self._check_portfolio_take_profit()
 
                 await asyncio.sleep(30)
 
             except Exception as e:
                 logger.error("Tier 3 error: {}", e)
                 await asyncio.sleep(5)
+
+    def _portfolio_take_profit_config(self) -> dict:
+        """Portfolio-level TP config for closing all managed positions."""
+        return self.config.execution_config.get("portfolio_take_profit", {}) or {}
+
+    def _portfolio_net_unrealized_pnl(self) -> float:
+        """Estimated net unrealized PnL across managed open positions."""
+        cfg = self._portfolio_take_profit_config()
+        fee_rate = float(cfg.get("estimated_round_trip_fee_rate", 0.0008) or 0.0)
+        mode = str(cfg.get("mode", "net") or "net").lower()
+        gross = sum(float(pos.unrealized_pnl or 0.0) for pos in self.open_positions)
+        if mode == "gross":
+            return gross
+        estimated_fees = sum(float(pos.trade.position_size or 0.0) * fee_rate for pos in self.open_positions)
+        return gross - estimated_fees
+
+    async def _check_portfolio_take_profit(self) -> None:
+        """Close all managed positions when combined net uPNL reaches target."""
+        cfg = self._portfolio_take_profit_config()
+        if not cfg.get("enabled", False):
+            return
+        if not self.open_positions:
+            return
+
+        target = float(cfg.get("target_usdt", 0) or 0)
+        if target <= 0:
+            return
+
+        combined_pnl = self._portfolio_net_unrealized_pnl()
+        if combined_pnl < target:
+            return
+
+        logger.info(
+            "Portfolio TP triggered: combined {} uPNL ${:.2f} >= ${:.2f}; closing {} positions",
+            str(cfg.get("mode", "net") or "net").upper(), combined_pnl, target, len(self.open_positions),
+        )
+        # Close sequentially to avoid Binance/order-race surprises.
+        for pos in list(self.open_positions):
+            await self._close_position(pos, "PORTFOLIO_TP")
+
+    async def _sync_open_positions_with_exchange(self) -> None:
+        """Reconcile all tracked positions before processing pending entries."""
+        for pos in list(self.open_positions):
+            await self._sync_position_with_exchange(pos)
+
+    def _is_dca_trade(self, trade: Trade) -> bool:
+        """Return True only for 0.618 orders that were explicitly created as DCA.
+
+        Plain scanner entries can also be at the configured 0.618 Fib level.
+        Those are normal first-leg trades when no 0.5 parent exists; treating
+        every 0.618 pending order as DCA caused fresh entries to be cancelled as
+        "orphan DCA" and sometimes flattened after a partial fill.
+        """
+        signal = trade.signal
+        if not signal:
+            return False
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        meta = signal.metadata or {}
+        dca_source = meta.get("dca_source")
+        if dca_source not in {"position_monitor", "scanner_parent"} and not meta.get("dca_parent_trade_id"):
+            return False
+        zone = meta.get("fib_zone", {}) or {}
+        try:
+            return round(float(zone.get("level", -1)), 3) == round(float(cfg.get("dca_to_level", 0.618)), 3)
+        except Exception:
+            return False
+
+    async def _cancel_orphan_dca_entries(self) -> None:
+        """Cancel pending 0.618 DCA orders whose 0.5 parent is no longer open."""
+        for trade in list(self.pending_entries):
+            signal = trade.signal
+            if not signal or not self._is_dca_trade(trade):
+                continue
+            if self._find_dca_parent(signal) is not None:
+                continue
+
+            managed_same_symbol = next(
+                (
+                    pos for pos in self.open_positions
+                    if pos.trade.signal
+                    and pos.trade.signal.symbol == signal.symbol
+                    and pos.trade.signal.direction == signal.direction
+                ),
+                None,
+            )
+
+            status = "unknown"
+            filled_amount = 0.0
+            try:
+                order = await self.client.get_order(signal.symbol, trade.entry_order_id)
+                status = order.get("status", "").lower()
+                filled_amount = float(
+                    order.get("filled")
+                    or order.get("info", {}).get("executedQty")
+                    or 0
+                )
+            except Exception as e:
+                logger.warning("Could not inspect orphan DCA {}: {}", trade.entry_order_id, e)
+
+            if managed_same_symbol is not None:
+                # Parent may already have been merged into a 0.618/2-leg trade,
+                # so _find_dca_parent() intentionally returns None. Never
+                # flatten a managed same-symbol position here; at most cancel a
+                # duplicate resting DCA order.
+                if status not in ("closed", "canceled", "cancelled", "expired", "rejected"):
+                    try:
+                        await self.client.cancel_order(signal.symbol, trade.entry_order_id)
+                        logger.warning(
+                            "Cancelled duplicate DCA while managed position exists: {} {} order={}",
+                            signal.direction, signal.symbol, trade.entry_order_id,
+                        )
+                    except Exception as e:
+                        logger.error("Failed to cancel duplicate DCA {}: {}", trade.entry_order_id, e)
+                elif status == "closed" or filled_amount > 0:
+                    logger.critical(
+                        "Duplicate DCA filled while managed position exists; leaving position open for normal protection: {} {} order={}",
+                        signal.direction, signal.symbol, trade.entry_order_id,
+                    )
+                    await self.notifier.error_alert(
+                        f"Duplicate DCA filled while managed position exists: {signal.symbol}. Check combined protection."
+                    )
+                if trade in self.pending_entries:
+                    self.pending_entries.remove(trade)
+                trade.status = "CANCELLED" if status != "closed" and filled_amount <= 0 else "CLOSED"
+                trade.close_reason = "DCA_DUPLICATE_AFTER_MERGE"
+                trade.closed_at = int(time.time() * 1000)
+                self.db.save_trade(trade)
+                continue
+
+            if status not in ("closed", "canceled", "cancelled", "expired", "rejected"):
+                try:
+                    await self.client.cancel_order(signal.symbol, trade.entry_order_id)
+                    logger.info(
+                        "Cancelled orphan DCA after parent close: {} {} order={}",
+                        signal.direction, signal.symbol, trade.entry_order_id,
+                    )
+                except Exception as e:
+                    logger.error("Failed to cancel orphan DCA {}: {}", trade.entry_order_id, e)
+
+            # If it somehow filled after the parent was gone, flatten it rather
+            # than managing it as a new standalone 0.618 entry.
+            if status == "closed" or filled_amount > 0:
+                try:
+                    expected_side = "long" if signal.direction == "LONG" else "short"
+                    close_side = "sell" if signal.direction == "LONG" else "buy"
+                    exchange_pos = await self.client.get_position(signal.symbol)
+                    if exchange_pos and (exchange_pos.get("side") or "").lower() == expected_side:
+                        amount = abs(float(exchange_pos.get("contracts") or filled_amount))
+                        if amount > 0:
+                            await self.client.close_position_market(signal.symbol, close_side, amount)
+                            logger.warning(
+                                "Flattened orphan DCA fill after parent close: {} {} amount={}",
+                                signal.direction, signal.symbol, amount,
+                            )
+                except Exception as e:
+                    logger.critical("Failed to flatten orphan DCA {}: {}", signal.symbol, e)
+                    await self.notifier.error_alert(
+                        f"Orphan DCA filled after parent close and flatten failed: {signal.symbol} — {e}"
+                    )
+
+            if trade in self.pending_entries:
+                self.pending_entries.remove(trade)
+            trade.status = "CANCELLED" if status != "closed" and filled_amount <= 0 else "CLOSED"
+            trade.close_reason = "DCA_PARENT_CLOSED"
+            trade.closed_at = int(time.time() * 1000)
+            self.db.save_trade(trade)
+
+    async def _maybe_dca_from_monitor(self, pos: PositionState) -> None:
+        """Trigger Fib DCA from the open trade's original swing/level.
+
+        Scanner-based DCA can miss the level when the swing recalculates. This
+        monitor uses the stored 0.5 entry swing and watches the stored 0.618
+        retracement directly.
+        """
+        trade = pos.trade
+        signal = trade.signal
+        if not signal:
+            return
+
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        if not cfg.get("dca_enabled", False):
+            return
+
+        meta = signal.metadata or {}
+        zone = meta.get("fib_zone", {}) or {}
+        swing = meta.get("swing", {}) or {}
+        try:
+            current_level = round(float(zone.get("level", -1)), 3)
+            from_level = round(float(cfg.get("dca_from_level", 0.5)), 3)
+            to_level = float(cfg.get("dca_to_level", 0.618))
+            legs = int(meta.get("dca_legs", 1) or 1)
+            max_legs = int(cfg.get("dca_max_legs", 2) or 2)
+            start = float(swing.get("start", 0))
+            end = float(swing.get("end", 0))
+        except Exception:
+            return
+
+        # On restart, Binance gives us the net position but stale DB metadata can
+        # still say this is a single 0.5 leg. If live notional is already larger
+        # than one planned leg, infer that DCA has happened and do not add more.
+        pos_cfg = self.config.risk_config.get("position", {})
+        planned_leg_notional = float(pos_cfg.get("fixed_margin_usdt", 0) or 0) * int(
+            pos_cfg.get("fixed_leverage", self.config.base_leverage)
+        )
+        if planned_leg_notional > 0 and trade.position_size >= planned_leg_notional * 1.5:
+            inferred_legs = max(2, round(trade.position_size / planned_leg_notional))
+            if inferred_legs >= max_legs:
+                if legs < inferred_legs:
+                    meta["dca_legs"] = inferred_legs
+                    meta["dca_inferred_from_notional"] = True
+                    signal.metadata = meta
+                    self.db.save_trade(trade)
+                return
+
+        if current_level != from_level or legs >= max_legs or start <= 0 or end <= 0:
+            return
+        if meta.get("dca_triggered_at"):
+            return
+
+        size = abs(end - start)
+        if size <= 0:
+            return
+        if swing.get("direction") == "UP":
+            dca_price = end - size * to_level
+            touched = pos.current_price <= dca_price
+        else:
+            dca_price = end + size * to_level
+            touched = pos.current_price >= dca_price
+        if not touched:
+            await self._ensure_monitor_dca_limit(pos, dca_price)
+            return
+
+        # Mark before order placement so a transient error doesn't loop several
+        # market DCA attempts every 30s without human review.
+        meta["dca_triggered_at"] = int(time.time() * 1000)
+        meta["dca_trigger_price"] = pos.current_price
+        signal.metadata = meta
+        self.db.save_trade(trade)
+
+        try:
+            await self._execute_monitor_dca(pos, dca_price)
+        except Exception as e:
+            logger.error("Monitor DCA failed for {}: {}", signal.symbol, e)
+            await self.notifier.error_alert(f"Monitor DCA failed: {signal.symbol} — {e}")
+
+    async def _ensure_monitor_dca_limit(self, pos: PositionState, dca_price: float) -> None:
+        """Keep one resting DCA limit order at the stored 0.618 level."""
+        trade = pos.trade
+        signal = trade.signal
+        if not signal:
+            return
+
+        dca_signal = self._build_monitor_dca_signal(signal, dca_price, dca_price)
+        if self._has_duplicate_pending_signal(dca_signal):
+            return
+
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        pos_cfg = self.config.risk_config.get("position", {})
+        leverage = int(pos_cfg.get("fixed_leverage", self.config.base_leverage))
+        notional = float(pos_cfg.get("fixed_margin_usdt", 5.0)) * leverage
+        if notional <= 0 or dca_price <= 0:
+            return
+
+        entry_side = "buy" if signal.direction == "LONG" else "sell"
+        amount = self.client.format_amount(signal.symbol, notional / dca_price)
+        min_amount = self.client.get_min_amount(signal.symbol)
+        if amount < min_amount:
+            logger.warning("DCA limit amount too small for {}: {} < {}", signal.symbol, amount, min_amount)
+            return
+
+        price = self.client.format_price(signal.symbol, dca_price)
+        order_id = await self.client.place_limit_order(signal.symbol, entry_side, amount, price)
+        dca_trade = Trade(
+            signal=dca_signal,
+            entry_order_id=order_id,
+            status="PENDING",
+            entry_fill_price=0.0,
+            position_size=notional,
+            margin_used=notional / leverage,
+            leverage=leverage,
+            opened_at=int(time.time() * 1000),
+        )
+        self.pending_entries.append(dca_trade)
+        self.db.save_trade(dca_trade)
+        logger.info(
+            "📝 DCA limit armed: {} {} ret_{} @ ${:.4f} size=${:.2f}",
+            signal.direction, signal.symbol, cfg.get("dca_to_level", 0.618), price, notional,
+        )
+
+    async def _execute_monitor_dca(self, pos: PositionState, dca_price: float) -> None:
+        trade = pos.trade
+        signal = trade.signal
+        if not signal:
+            return
+
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        pos_cfg = self.config.risk_config.get("position", {})
+        leverage = int(pos_cfg.get("fixed_leverage", self.config.base_leverage))
+        notional = float(pos_cfg.get("fixed_margin_usdt", 5.0)) * leverage
+        if notional <= 0 or pos.current_price <= 0:
+            return
+
+        entry_side = "buy" if signal.direction == "LONG" else "sell"
+        amount = self.client.format_amount(signal.symbol, notional / pos.current_price)
+        min_amount = self.client.get_min_amount(signal.symbol)
+        if amount < min_amount:
+            logger.warning("DCA amount too small for {}: {} < {}", signal.symbol, amount, min_amount)
+            return
+
+        order_id = await self.client.place_market_order(signal.symbol, entry_side, amount)
+        try:
+            order = await self.client.get_order(signal.symbol, order_id)
+        except Exception:
+            order = {"id": order_id, "average": pos.current_price, "price": pos.current_price, "filled": amount, "amount": amount}
+
+        fill_price = float(order.get("average") or order.get("price") or pos.current_price)
+        filled_amount = float(
+            order.get("filled")
+            or order.get("amount")
+            or order.get("info", {}).get("executedQty")
+            or amount
+        )
+
+        dca_signal = self._build_monitor_dca_signal(signal, fill_price, dca_price)
+
+        dca_trade = Trade(
+            signal=dca_signal,
+            entry_order_id=order_id,
+            status="OPEN",
+            entry_fill_price=fill_price,
+            position_size=notional,
+            margin_used=notional / leverage,
+            leverage=leverage,
+            opened_at=int(time.time() * 1000),
+        )
+
+        exchange_pos = await self.client.get_position(signal.symbol)
+        if not exchange_pos:
+            raise RuntimeError("DCA order filled but exchange position not found")
+        await self._merge_dca_fill(pos, dca_trade, order, exchange_pos, "MONITOR_DCA")
+
+    def _build_monitor_dca_signal(self, signal: Signal, entry_price: float, dca_price: float) -> Signal:
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        dca_signal = copy.deepcopy(signal)
+        dca_signal.entry_price = entry_price
+        dca_signal.metadata = copy.deepcopy(signal.metadata or {})
+        dca_signal.metadata["fib_zone"] = {
+            "name": f"ret_{cfg.get('dca_to_level', 0.618)}",
+            "low": dca_price,
+            "high": dca_price,
+            "level": float(cfg.get("dca_to_level", 0.618)),
+        }
+        dca_signal.metadata["dca_source"] = "position_monitor"
+        return dca_signal
 
     async def _manage_exit(self, pos: PositionState) -> None:
         """Manage trailing stop and time-based exit for a position."""
@@ -339,6 +836,8 @@ class Bot:
 
         exec_cfg = self.config.execution_config
         trail_cfg = exec_cfg.get("trailing", {})
+        if not trail_cfg.get("enabled", True):
+            return
 
         # ── Breakeven ──
         be_rr = trail_cfg.get("breakeven_at_rr", 1.5)
@@ -469,6 +968,7 @@ class Bot:
             await self.client.cancel_order(signal.symbol, order_id)
 
         exit_price = pos.current_price
+        actual_fees = None
         if exit_order:
             exit_price = float(
                 exit_order.get("average")
@@ -478,6 +978,10 @@ class Bot:
                 or exit_order.get("info", {}).get("stopPrice")
                 or exit_price
             )
+        else:
+            trade_fill = await self._recent_exit_fill(signal.symbol, signal.direction, trade.opened_at)
+            if trade_fill:
+                exit_price, actual_fees = trade_fill
 
         trade.status = "CLOSED"
         trade.exit_fill_price = exit_price
@@ -486,7 +990,7 @@ class Bot:
                 trade.pnl = (exit_price - trade.entry_fill_price) / trade.entry_fill_price * trade.position_size
             else:
                 trade.pnl = (trade.entry_fill_price - exit_price) / trade.entry_fill_price * trade.position_size
-            trade.fees = trade.position_size * 0.0004 * 2
+            trade.fees = actual_fees if actual_fees is not None else trade.position_size * 0.0004 * 2
             trade.net_pnl = trade.pnl - trade.fees
         trade.closed_at = int(time.time() * 1000)
         trade.close_reason = close_reason
@@ -504,6 +1008,45 @@ class Bot:
         )
         return None
 
+    async def _recent_exit_fill(
+        self,
+        symbol: str,
+        direction: str,
+        opened_at: int,
+    ) -> tuple[float, float] | None:
+        """Infer actual exit fill from account trades when algo order lookup fails.
+
+        Binance testnet sometimes returns -2013 for filled STOP_MARKET /
+        TAKE_PROFIT_MARKET algo IDs. In that case, use recent opposite-side
+        account trades after the entry opened time instead of the stale mark
+        price from the last position snapshot.
+        """
+        try:
+            fills = await self.client.get_my_trades(symbol, limit=100)
+        except Exception as e:
+            logger.warning("Could not fetch fills for {} reconciliation: {}", symbol, e)
+            return None
+
+        exit_side = "sell" if direction == "LONG" else "buy"
+        matched = []
+        for fill in fills:
+            if fill.get("timestamp", 0) <= opened_at:
+                continue
+            if str(fill.get("side", "")).lower() != exit_side:
+                continue
+            info = fill.get("info", {}) or {}
+            # Entry fills have zero realizedPnl; closing fills report realizedPnl.
+            if float(info.get("realizedPnl", 0) or 0) == 0:
+                continue
+            matched.append(fill)
+
+        amount = sum(float(f.get("amount", 0) or 0) for f in matched)
+        if amount <= 0:
+            return None
+        cost = sum(float(f.get("cost", 0) or 0) for f in matched)
+        fees = sum(float((f.get("fee") or {}).get("cost", 0) or 0) for f in matched)
+        return cost / amount, fees
+
     # ── Trade Execution ────────────────────────────────────
 
     async def _execute_signal(self, signal: Signal) -> Trade | None:
@@ -516,11 +1059,22 @@ class Bot:
                 logger.warning("Skipping new entry: unmanaged exchange position exists")
                 return None
 
+            dca_parent = self._find_dca_parent(signal)
+            if dca_parent is not None:
+                signal = copy.deepcopy(signal)
+                signal.metadata = copy.deepcopy(signal.metadata or {})
+                signal.metadata["dca_source"] = "scanner_parent"
+                signal.metadata["dca_parent_trade_id"] = dca_parent.trade.id
+
+            if self._has_duplicate_pending_signal(signal):
+                logger.info("Skipping duplicate pending Fib entry: {} {}", signal.symbol, signal.metadata.get("fib_zone", {}).get("name"))
+                return None
+
             balance = await self.client.get_balance()
 
             # Check combined pending + open against limits
             max_pos = self.config.max_open_positions
-            if len(self.open_positions) + len(self.pending_entries) >= max_pos:
+            if max_pos > 0 and len(self.open_positions) + len(self.pending_entries) >= max_pos:
                 logger.warning("Position limit reached (open={}, pending={})",
                                len(self.open_positions), len(self.pending_entries))
                 return None
@@ -628,6 +1182,31 @@ class Bot:
             await self.notifier.error_alert(f"Execution failed: {signal.symbol} — {e}")
             return None
 
+    def _has_duplicate_pending_signal(self, signal: Signal) -> bool:
+        """Avoid stacking identical pending orders for the same Fib zone/swing."""
+        meta = signal.metadata or {}
+        zone = meta.get("fib_zone", {}) or {}
+        swing = meta.get("swing", {}) or {}
+        level = zone.get("level")
+        if level is None:
+            return any(t.signal and t.signal.symbol == signal.symbol for t in self.pending_entries)
+
+        for trade in self.pending_entries:
+            old = trade.signal
+            if not old or old.symbol != signal.symbol or old.direction != signal.direction:
+                continue
+            old_meta = old.metadata or {}
+            old_zone = old_meta.get("fib_zone", {}) or {}
+            old_swing = old_meta.get("swing", {}) or {}
+            try:
+                if round(float(old_zone.get("level", -1)), 3) != round(float(level), 3):
+                    continue
+            except Exception:
+                continue
+            if self._same_fib_swing(swing, old_swing):
+                return True
+        return False
+
     async def _has_unmanaged_exchange_positions(self) -> bool:
         """Return True when Binance has positions this bot is not managing."""
         managed_symbols = {
@@ -685,6 +1264,13 @@ class Bot:
                     logger.info("Entry {} for {} {}", status, signal.direction, signal.symbol)
 
                 else:
+                    if self._is_dca_trade(trade):
+                        # DCA limits are intentionally standing orders at the
+                        # stored 0.618 level. They should live until filled,
+                        # cancelled/rejected by exchange, or removed by the
+                        # orphan-DCA guard when the parent position closes.
+                        continue
+
                     # Check timeout
                     age_s = (time.time() * 1000 - trade.opened_at) / 1000
                     if age_s > entry_timeout:
@@ -714,6 +1300,168 @@ class Bot:
 
             except Exception as e:
                 logger.error("Error checking pending entry {}: {}", trade.entry_order_id, e)
+
+    def _find_dca_parent(self, signal: Signal) -> PositionState | None:
+        """Return the existing 0.5 Fib position that this 0.618 signal should DCA."""
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        if not cfg.get("dca_enabled", False):
+            return None
+
+        new_meta = signal.metadata or {}
+        new_zone = new_meta.get("fib_zone", {}) or {}
+        new_swing = new_meta.get("swing", {}) or {}
+        try:
+            new_level = round(float(new_zone.get("level", -1)), 3)
+            to_level = round(float(cfg.get("dca_to_level", 0.618)), 3)
+            from_level = round(float(cfg.get("dca_from_level", 0.5)), 3)
+            max_legs = int(cfg.get("dca_max_legs", 2) or 2)
+        except Exception:
+            return None
+        if new_level != to_level:
+            return None
+
+        for pos in self.open_positions:
+            old = pos.trade.signal
+            if not old or old.symbol != signal.symbol or old.direction != signal.direction:
+                continue
+            old_meta = old.metadata or {}
+            old_zone = old_meta.get("fib_zone", {}) or {}
+            old_swing = old_meta.get("swing", {}) or {}
+            try:
+                old_level = round(float(old_zone.get("level", -1)), 3)
+                old_legs = int(old_meta.get("dca_legs", 1) or 1)
+            except Exception:
+                continue
+            if old_level != from_level or old_legs >= max_legs:
+                continue
+            if self._same_fib_swing(new_swing, old_swing):
+                return pos
+        return None
+
+    async def _merge_dca_fill(
+        self,
+        parent: PositionState,
+        dca_trade: Trade,
+        order: dict,
+        exchange_pos: dict,
+        reason: str,
+    ) -> None:
+        """Merge a filled 0.618 DCA leg into the existing exchange position.
+
+        Binance runs this account as a net position. After DCA fills, replace the
+        old protection with one combined SL/TP sized to the total position.
+        """
+        parent_trade = parent.trade
+        signal = dca_trade.signal
+        if not signal or not parent_trade.signal:
+            return
+
+        sl_side = "sell" if signal.direction == "LONG" else "buy"
+        position_amount = abs(float(exchange_pos.get("contracts") or 0))
+        avg_entry = float(
+            exchange_pos.get("entryPrice")
+            or exchange_pos.get("entry_price")
+            or exchange_pos.get("info", {}).get("entryPrice")
+            or dca_trade.entry_fill_price
+            or order.get("average", 0)
+            or order.get("price", 0)
+        )
+        if position_amount <= 0 or avg_entry <= 0:
+            raise RuntimeError(f"Invalid DCA merge details for {signal.symbol}: amount={position_amount}, avg={avg_entry}")
+
+        # Remove old reduce-only protection before placing combined protection.
+        for order_id in (parent_trade.stop_order_id, parent_trade.tp_order_id):
+            if order_id:
+                await self.client.cancel_order(signal.symbol, order_id)
+
+        old_meta = parent_trade.signal.metadata or {}
+        old_legs = int(old_meta.get("dca_legs", 1) or 1)
+        new_legs = old_legs + 1
+        total_notional = position_amount * avg_entry
+        stop, tp = self._combined_fixed_pnl_exits(avg_entry, total_notional, signal.direction, new_legs)
+        signal.stop_loss = stop
+        signal.take_profit = tp
+        signal.metadata["dca_legs"] = new_legs
+        signal.metadata["dca_parent_trade_id"] = parent_trade.id
+        signal.metadata["dca_merged_trade_id"] = dca_trade.id
+
+        amount = self.client.format_amount(signal.symbol, position_amount)
+        sl_price = self.client.format_price(signal.symbol, stop)
+        tp_price = self.client.format_price(signal.symbol, tp)
+        sl_id = await self.client.place_stop_loss(signal.symbol, sl_side, amount, sl_price)
+        tp_id = await self.client.place_take_profit(signal.symbol, sl_side, amount, tp_price)
+
+        parent_trade.signal = signal
+        parent_trade.entry_order_id = ",".join(x for x in [parent_trade.entry_order_id, dca_trade.entry_order_id] if x)
+        parent_trade.entry_fill_price = avg_entry
+        parent_trade.position_size = round(total_notional, 2)
+        parent_trade.margin_used = round(total_notional / max(parent_trade.leverage, 1), 2)
+        parent_trade.stop_order_id = sl_id
+        parent_trade.tp_order_id = tp_id
+        parent.trailing_stop = 0.0
+
+        if dca_trade in self.pending_entries:
+            self.pending_entries.remove(dca_trade)
+        dca_trade.status = "CLOSED"
+        dca_trade.close_reason = "DCA_MERGED"
+        dca_trade.closed_at = int(time.time() * 1000)
+
+        self.db.save_trade(dca_trade)
+        self.db.save_trade(parent_trade)
+        logger.info(
+            "✅ DCA merged: {} {} legs={} avg=${:.4f} size=${:.2f} SL=${:.4f} TP=${:.4f}",
+            signal.direction, signal.symbol, new_legs, avg_entry, total_notional, sl_price, tp_price,
+        )
+
+    def _combined_fixed_pnl_exits(
+        self,
+        avg_entry: float,
+        total_notional: float,
+        direction: str,
+        legs: int,
+    ) -> tuple[float, float]:
+        """Return combined SL/TP preserving fixed PnL per DCA leg."""
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        # DCA should cap total loss for the merged net position, not multiply
+        # risk by legs. Without explicit DCA caps, keep the old per-leg behavior.
+        if cfg.get("dca_max_total_loss_usdt") is not None:
+            risk_usdt = float(cfg.get("dca_max_total_loss_usdt", 10.0))
+            reward_usdt = float(cfg.get("dca_reward_usdt", risk_usdt * 1.5))
+        else:
+            risk_usdt = float(cfg.get("stop_loss_usdt", 5.0)) * legs
+            reward_usdt = float(cfg.get("take_profit_usdt", risk_usdt)) * legs
+        if total_notional <= 0:
+            return avg_entry, avg_entry
+        stop_pct = risk_usdt / total_notional
+        tp_pct = reward_usdt / total_notional
+        if direction == "LONG":
+            return avg_entry * (1 - stop_pct), avg_entry * (1 + tp_pct)
+        return avg_entry * (1 + stop_pct), avg_entry * (1 - tp_pct)
+
+    def _fixed_pnl_exits_from_fill(
+        self,
+        fill_price: float,
+        total_notional: float,
+        direction: str,
+    ) -> tuple[float, float]:
+        """Return SL/TP from actual fill so fixed-PnL risk is exact.
+
+        Signal generation estimates fixed-PnL exits from the intended limit
+        entry. Limit fills can improve/slip versus that intended price, so
+        placing protection from the signal price can make realized max loss
+        smaller/larger than configured. Recalculate after fill using the real
+        exchange position notional.
+        """
+        cfg = self.config.get("strategy", "fibonacci", default={})
+        risk_usdt = float(cfg.get("stop_loss_usdt", 5.0))
+        reward_usdt = float(cfg.get("take_profit_usdt", risk_usdt))
+        if fill_price <= 0 or total_notional <= 0:
+            return fill_price, fill_price
+        stop_pct = risk_usdt / total_notional
+        tp_pct = reward_usdt / total_notional
+        if direction == "LONG":
+            return fill_price * (1 - stop_pct), fill_price * (1 + tp_pct)
+        return fill_price * (1 + stop_pct), fill_price * (1 - tp_pct)
 
     async def _promote_filled_entry(self, trade: Trade, order: dict, reason: str) -> None:
         """Promote a filled/partially-filled entry to OPEN and place protection.
@@ -769,6 +1517,24 @@ class Bot:
 
         position_amount = abs(float(exchange_pos.get("contracts") or filled_amount))
         amount = self.client.format_amount(signal.symbol, position_amount)
+
+        dca_parent = self._find_dca_parent(signal)
+        if dca_parent is not None:
+            await self._merge_dca_fill(dca_parent, trade, order, exchange_pos, reason)
+            return
+
+        actual_notional = abs(float(exchange_pos.get("notional") or 0))
+        if actual_notional <= 0:
+            actual_notional = position_amount * fill_price
+        if self.config.get("strategy", "fibonacci", "exit_mode", default="fixed_pnl") == "fixed_pnl":
+            stop_loss, take_profit = self._fixed_pnl_exits_from_fill(
+                fill_price, actual_notional, signal.direction,
+            )
+            signal.stop_loss = stop_loss
+            signal.take_profit = take_profit
+            trade.stop_loss = stop_loss
+            trade.take_profit = take_profit
+
         sl_price = self.client.format_price(signal.symbol, signal.stop_loss)
         tp_price = self.client.format_price(signal.symbol, signal.take_profit)
 
@@ -886,11 +1652,22 @@ class Bot:
         """Recover open positions after restart — reconstruct full state."""
         try:
             positions = await self.client.get_positions()
+            await self._cancel_orphan_entry_orders()
             if not positions:
                 logger.info("No open positions to recover")
                 return
 
             logger.info("Recovering {} open positions...", len(positions))
+            db_open = {}
+            try:
+                for row in self.db.get_open_trades():
+                    if row.get("status") != "OPEN":
+                        continue
+                    key = (row.get("symbol"), row.get("direction"))
+                    if key not in db_open or int(row.get("opened_at") or 0) > int(db_open[key].get("opened_at") or 0):
+                        db_open[key] = row
+            except Exception as e:
+                logger.warning("Could not load DB metadata for recovery: {}", e)
 
             for p in positions:
                 try:
@@ -908,6 +1685,11 @@ class Bot:
                     continue
 
                 direction = "LONG" if side == "long" else "SHORT"
+                db_trade = db_open.get((symbol, direction), {})
+                try:
+                    recovered_meta = json.loads(db_trade.get("metadata") or "{}") if db_trade else {}
+                except Exception:
+                    recovered_meta = {}
 
                 # Build minimal signal for recovered position
                 signal = Signal(
@@ -920,6 +1702,7 @@ class Bot:
                     quality="RECOVERED",
                     regime="UNKNOWN",
                     timestamp=int(time.time() * 1000),
+                    metadata=recovered_meta,
                 )
 
                 trade = Trade(
@@ -928,7 +1711,7 @@ class Bot:
                     entry_fill_price=entry_price,
                     position_size=notional if notional > 0 else contracts * entry_price,
                     leverage=leverage,
-                    opened_at=int(time.time() * 1000),
+                    opened_at=int(db_trade.get("opened_at") or int(time.time() * 1000)) if db_trade else int(time.time() * 1000),
                 )
 
                 # Try to find existing SL/TP orders on exchange
@@ -967,6 +1750,34 @@ class Bot:
 
         except Exception as e:
             logger.warning("Position recovery failed: {}", e)
+
+    async def _cancel_orphan_entry_orders(self) -> None:
+        """Cancel regular non-reduce-only entry orders left across restarts.
+
+        Open positions can be recovered because they have SL/TP context. A naked
+        unfilled entry order after restart is unsafe: if it fills later, the new
+        process does not know to place protection. Cancel these on startup.
+        """
+        try:
+            open_orders = await self.client.get_open_orders()
+        except Exception as e:
+            logger.warning("Could not inspect open orders during recovery: {}", e)
+            return
+
+        for order in open_orders:
+            otype = str(order.get("type", "")).lower()
+            reduce_only = bool(order.get("reduceOnly") or order.get("info", {}).get("reduceOnly"))
+            if reduce_only or otype not in ("limit", "market"):
+                continue
+            symbol = order.get("symbol") or ""
+            order_id = str(order.get("id") or "")
+            if not symbol or not order_id:
+                continue
+            try:
+                await self.client.cancel_order(symbol, order_id)
+                logger.warning("Cancelled orphan entry order on startup: {} {}", symbol, order_id)
+            except Exception as e:
+                logger.error("Failed to cancel orphan entry order {} {}: {}", symbol, order_id, e)
 
     # ── Timing ─────────────────────────────────────────────
 

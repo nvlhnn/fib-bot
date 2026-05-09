@@ -26,6 +26,8 @@ class Swing:
     end_idx: int
     atr_multiple: float
     pct: float
+    start_ts: int = 0
+    end_ts: int = 0
 
     @property
     def size(self) -> float:
@@ -157,15 +159,45 @@ class FibonacciScorer:
             return None
 
         direction = "LONG" if swing.direction == "UP" else "SHORT"
-        if cfg.get("trend_filter", True):
-            if direction == "LONG" and ind.current_price < ind.ema_50_15m:
-                return None
-            if direction == "SHORT" and ind.current_price > ind.ema_50_15m:
-                return None
+        zones = self._retracement_zones(swing, cfg)
+        zone = self._matching_zone(ind.current_price, zones)
+        touch_count = 0
+        entry_price = ind.current_price
+        early_touch = False
 
-        zone = self._matching_zone(ind.current_price, self._retracement_zones(swing, cfg))
+        if zone is None and cfg.get("enter_on_zone_touch", True):
+            zone = self._matching_zone_touch(candles_5m[-1], zones)
+            if zone is not None:
+                touch_count = self._zone_touch_count(candles_5m, zone, swing.end_ts)
+                max_touches = int(cfg.get("max_entry_zone_touches", 2))
+                if touch_count <= 0 or touch_count > max_touches:
+                    return None
+                early_touch = True
+                entry_price = zone.high if direction == "LONG" else zone.low
+        elif zone is not None:
+            touch_count = self._zone_touch_count(candles_5m, zone, swing.end_ts)
+            max_touches = int(cfg.get("max_entry_zone_touches", 2))
+            early_touch = 0 < touch_count <= max_touches
+
         if zone is None:
             return None
+
+        if cfg.get("trend_filter", True):
+            strict_trend_ok = (
+                ind.current_price >= ind.ema_50_15m
+                if direction == "LONG"
+                else ind.current_price <= ind.ema_50_15m
+            )
+            deep_trend_ok = False
+            if zone.level >= cfg.get("deep_zone_trend_bypass_level", 0.618):
+                bypass_pct = cfg.get("deep_zone_trend_bypass_pct", 0.6) / 100.0
+                deep_trend_ok = (
+                    ind.current_price >= ind.ema_50_15m * (1 - bypass_pct)
+                    if direction == "LONG"
+                    else ind.current_price <= ind.ema_50_15m * (1 + bypass_pct)
+                )
+            if not strict_trend_ok and not deep_trend_ok:
+                return None
 
         rejection = self._rejection_score(candles_5m[-1], direction)
         volume = 1 if ind.volume_ratio >= cfg.get("volume_ratio_min", 1.2) else 0
@@ -173,12 +205,19 @@ class FibonacciScorer:
             return None
 
         fib_score = 3 if 0.5 <= zone.level <= 0.618 else 2
-        total = fib_score + rejection + volume + regime_score
+        early_touch_bonus = int(cfg.get("early_zone_touch_bonus", 1)) if early_touch else 0
+        total = fib_score + rejection + volume + regime_score + early_touch_bonus
+        q_filters = cfg.get("quality_filters", {}) or {}
+        min_confirmation_score = int(q_filters.get("require_confirmation_below_score", 0) or 0)
+        if min_confirmation_score > 0 and total < min_confirmation_score and rejection == 0 and volume == 0:
+            return None
+        if not self._passes_trend_pullback_quality_filters(ind, regime_name, early_touch, cfg):
+            return None
         if total < self._cfg.scoring_config.get("min_score", 5):
             return None
 
         entry, stop, tp = self._pullback_levels(
-            ind.current_price, swing, zone, direction, ind.atr, cfg,
+            entry_price, swing, zone, direction, ind.atr, cfg,
         )
         if entry <= 0 or stop <= 0 or tp <= 0:
             return None
@@ -186,7 +225,13 @@ class FibonacciScorer:
         return self._signal(
             ind, direction, entry, stop, tp, total, quality, size_mult, regime_name,
             "trend_pullback", swing, zone,
-            {"fib": fib_score, "rejection": rejection, "volume": volume, "regime": regime_score},
+            {
+                "fib": fib_score,
+                "early_touch": early_touch_bonus,
+                "rejection": rejection,
+                "volume": volume,
+                "regime": regime_score,
+            },
         )
 
     def _evaluate_confluence(self, *args, **kwargs) -> Signal | None:
@@ -231,7 +276,10 @@ class FibonacciScorer:
         if end_idx < lookback - cfg.get("max_swing_age", 48):
             return None
 
-        return Swing(direction, start, end, start_idx, end_idx, atr_multiple, pct)
+        return Swing(
+            direction, start, end, start_idx, end_idx, atr_multiple, pct,
+            int(window[start_idx].timestamp), int(window[end_idx].timestamp),
+        )
 
     def _extension_zones(self, swing: Swing, cfg: dict) -> list[FibZone]:
         tolerance = cfg.get("zone_tolerance_pct", 0.12) / 100.0
@@ -270,6 +318,53 @@ class FibonacciScorer:
         if not matches:
             return None
         return sorted(matches, key=lambda z: abs(price - (z.low + z.high) / 2))[0]
+
+    def _matching_zone_touch(self, candle: Candle, zones: list[FibZone]) -> FibZone | None:
+        matches = [z for z in zones if candle.low <= z.high and candle.high >= z.low]
+        if not matches:
+            return None
+        return sorted(matches, key=lambda z: abs(candle.close - (z.low + z.high) / 2))[0]
+
+    def _zone_touch_count(self, candles: list[Candle], zone: FibZone, after_ts: int) -> int:
+        touches = 0
+        in_touch = False
+        for candle in candles:
+            if after_ts and candle.timestamp <= after_ts:
+                continue
+            touching = candle.low <= zone.high and candle.high >= zone.low
+            if touching and not in_touch:
+                touches += 1
+            in_touch = touching
+        return touches
+
+    def _passes_trend_pullback_quality_filters(
+        self,
+        ind: IndicatorSet,
+        regime_name: str,
+        early_touch: bool,
+        cfg: dict,
+    ) -> bool:
+        """Extra data-driven guardrails from live trade history analysis.
+
+        Fib winners clustered around VOLATILE/SQUEEZE regimes, or otherwise
+        decent trend strength with RSI in a healthier 40-70 band. Stale/retest
+        entries underperformed, so require first/early zone touch when enabled.
+        """
+        filters = cfg.get("quality_filters", {}) or {}
+        if not filters.get("enabled", False):
+            return True
+
+        if filters.get("require_early_touch", False) and not early_touch:
+            return False
+
+        strong_regimes = set(filters.get("strong_regimes", ["VOLATILE", "SQUEEZE"]))
+        if regime_name in strong_regimes:
+            return True
+
+        min_adx = float(filters.get("min_adx", 20.0))
+        rsi_min = float(filters.get("rsi_min", 40.0))
+        rsi_max = float(filters.get("rsi_max", 70.0))
+        return ind.adx >= min_adx and rsi_min <= ind.rsi <= rsi_max
 
     # ── Confirmation / levels ──────────────────────────────
 
@@ -441,6 +536,30 @@ class FibonacciScorer:
                 },
                 "fib_zone": {"name": zone.name, "low": zone.low, "high": zone.high, "level": zone.level},
                 "layer_scores": scores,
+                "indicators": {
+                    "current_price": ind.current_price,
+                    "rsi": ind.rsi,
+                    "adx": ind.adx,
+                    "atr": ind.atr,
+                    "atr_pct": (ind.atr / ind.current_price * 100) if ind.current_price else 0,
+                    "bb_width": ind.bb_width,
+                    "bb_width_percentile": ind.bb_width_percentile,
+                    "ema_50_5m": ind.ema_50_5m,
+                    "ema_50_15m": ind.ema_50_15m,
+                    "ema_200_1h": ind.ema_200_1h,
+                    "trend_bias": ind.trend_bias,
+                    "vwap": ind.vwap,
+                    "prev_session_high": ind.prev_session_high,
+                    "prev_session_low": ind.prev_session_low,
+                    "divergence_type": ind.divergence_type,
+                    "divergence_strength": ind.divergence_strength,
+                    "current_volume": ind.current_volume,
+                    "volume_sma_20": ind.volume_sma_20,
+                    "volume_ratio": ind.volume_ratio,
+                    "candle_pattern": ind.candle_pattern,
+                    "near_levels": ind.near_levels,
+                },
+                # Keep legacy top-level keys for older notification/recovery code.
                 "volume_ratio": ind.volume_ratio,
                 "rsi": ind.rsi,
                 "adx": ind.adx,

@@ -18,19 +18,40 @@ strategy:
     min_impulse_atr: 2.0
     min_impulse_pct: 0.4
     reversal_extensions: [1.272, 1.618]
-    pullback_retracements: [0.382, 0.5, 0.618]
+    pullback_retracements: [0.5, 0.618]
     exit_mode: "fixed_pnl"
-    fixed_margin_usdt: 5.0
-    fixed_leverage: 50
-    stop_loss_usdt: 5.0
-    take_profit_usdt: 5.0
+    fixed_margin_usdt: 12.5
+    fixed_leverage: 20
+    stop_loss_usdt: 10.0
+    take_profit_usdt: 20.0
     pullback_take_profit_retracement: 0.236
     shallow_entry_stop_level: 0.618
     deep_entry_stop_level: 0.786
     reversal_take_profit_retracement: 0.618
     zone_tolerance_pct: 0.12
+    enter_on_zone_touch: true
+    max_entry_zone_touches: 2
+    dca_enabled: false
+    dca_from_level: 0.5
+    dca_to_level: 0.618
+    dca_max_legs: 2
+    dca_max_total_loss_usdt: 5.0
+    dca_reward_usdt: 5.0
+    early_zone_touch_bonus: 1
+    quality_filters:
+      enabled: true
+      strong_regimes: ["VOLATILE", "SQUEEZE"]
+      min_adx: 20.0
+      rsi_min: 35.0
+      rsi_max: 75.0
+      require_early_touch: false
+      require_confirmation_below_score: 7
+    deep_zone_trend_bypass_level: 0.618
+    deep_zone_trend_bypass_pct: 0.6
+    zone_cooldown_minutes: 15
+    block_zone_after_loss: true
     volume_ratio_min: 1.2
-    require_confirmation: true
+    require_confirmation: false
     require_volume: false
     trend_filter: true
     avoid_dead_regime: true
@@ -88,10 +109,10 @@ strategy:
 
   # Signal Scoring
   scoring:
-    min_score: 5
+    min_score: 4
     a_plus_threshold: 11
     a_threshold: 9
-    b_threshold: 5
+    b_threshold: 4
     b_size_multiplier: 0.75
 
 # ──────────────────────────────────────────────────────────
@@ -103,7 +124,8 @@ screening:
   dynamic:
     scan_pool: "all"
     rescreen_interval_hours: 4
-    max_active_coins: 50
+    max_active_coins: 30
+    atr_scan_limit: 40
 
     filters:
       min_24h_volume: 50000000
@@ -137,6 +159,12 @@ execution:
   limit_price_buffer_pct: 0.02
   order_timeout_candles: 3
 
+  portfolio_take_profit:
+    enabled: true
+    mode: "net"
+    target_usdt: 20.0
+    estimated_round_trip_fee_rate: 0.0008
+
   stop_loss:
     method: "atr"
     atr_multiplier: 1.5
@@ -146,17 +174,18 @@ execution:
 
   take_profit:
     rr_ratio: 2.0
-    min_rr_ratio: 1.5
+    min_rr_ratio: 2.0
 
   trailing:
+    enabled: false
     activate_at_rr: 1.5
-    breakeven_at_rr: 1.5
+    breakeven_at_rr: 0.7
     breakeven_buffer_pct: 0.05
     trail_by_atr: true
     trail_atr_multiplier: 1.0
 
   time_stop:
-    enabled: true
+    enabled: false
     max_bars: 15
     min_move_pct: 0.3
 
@@ -166,22 +195,22 @@ execution:
 risk:
   position:
     sizing_mode: "fixed_margin"
-    fixed_margin_usdt: 5.0
-    fixed_leverage: 50
+    fixed_margin_usdt: 12.5
+    fixed_leverage: 20
     risk_per_trade_pct: 0.5
     max_margin_pct: 10.0
     min_order_value: 5.0
 
   leverage:
-    base: 50
-    min: 50
-    max: 50
+    base: 20
+    min: 20
+    max: 20
     dynamic: false
 
   limits:
-    max_open_positions: 3
+    max_open_positions: 0  # 0 or lower = unlimited
     max_daily_trades: 0
-    max_same_direction: 2
+    max_same_direction: 4
 
   circuit_breakers:
     daily_loss:
@@ -219,7 +248,7 @@ notifications:
       signal_detected: true
       position_opened: true
       position_closed: true
-      stop_moved: true
+      stop_moved: false
       daily_summary: true
       circuit_breaker: true
       error_alert: true
@@ -249,3 +278,14 @@ database:
     interval_hours: 24
     max_backups: 7
     path: "data/backups/"
+
+# ──────────────────────────────────────────────────────────
+# DASHBOARD — CLOSED TRADE HISTORY
+# ──────────────────────────────────────────────────────────
+dashboard:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8090
+  database_path: "data/fib.db"
+  refresh_seconds: 30
+  default_range: "all"

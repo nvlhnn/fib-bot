@@ -8,6 +8,8 @@ placing orders, managing positions, and querying account state.
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Any
 
 import ccxt.async_support as ccxt
@@ -25,6 +27,48 @@ class BinanceClient:
         self._exchange: ccxt.binanceusdm | None = None
         self._exchange_info: dict | None = None  # Cached
         self._raw_to_unified: dict[str, str] = {}  # Raw symbol → unified symbol map
+        self._banned_until_ms = 0
+        self._ban_logged_until_ms = 0
+
+    # ── Rate-limit / ban backoff ──────────────────────────
+
+    @property
+    def banned_until_ms(self) -> int:
+        return self._banned_until_ms
+
+    def is_rate_limited(self) -> bool:
+        return int(time.time() * 1000) < self._banned_until_ms
+
+    def rate_limit_sleep_seconds(self, buffer_seconds: int = 5) -> float:
+        remaining = (self._banned_until_ms - int(time.time() * 1000)) / 1000
+        return max(0.0, remaining + buffer_seconds)
+
+    def _rate_limit_message(self) -> str:
+        return f"Binance API temporarily banned until {self._banned_until_ms}"
+
+    def _remember_rate_limit(self, error: Exception) -> None:
+        """Record Binance 418 ban windows so loops stop hammering testnet."""
+        text = str(error)
+        match = re.search(r"banned until (\d+)", text)
+        if not match and "418" not in text and "-1003" not in text:
+            return
+
+        # Binance usually sends a millisecond epoch. If it does not, use a
+        # conservative 60s cool-off so we still stop extending the ban.
+        until_ms = int(match.group(1)) if match else int(time.time() * 1000) + 60_000
+        self._banned_until_ms = max(self._banned_until_ms, until_ms)
+
+        if self._ban_logged_until_ms != self._banned_until_ms:
+            self._ban_logged_until_ms = self._banned_until_ms
+            wait_s = self.rate_limit_sleep_seconds(buffer_seconds=0)
+            logger.warning(
+                "Binance rate-limit ban detected; pausing API calls for {:.0f}s until {}",
+                wait_s, self._banned_until_ms,
+            )
+
+    def _raise_if_rate_limited(self) -> None:
+        if self.is_rate_limited():
+            raise RuntimeError(self._rate_limit_message())
 
     # ── Connection ─────────────────────────────────────────
 
@@ -60,7 +104,12 @@ class BinanceClient:
 
         # Test connectivity
         await self._exchange.load_markets()
-        balance = await self.get_balance()
+        try:
+            balance = await self.get_balance()
+        except Exception as e:
+            self._remember_rate_limit(e)
+            logger.warning("Balance check skipped during connect: {}", e)
+            balance = 0.0
         mode = "TESTNET" if self._cfg.is_testnet else "LIVE"
         logger.info("Binance {} connected — balance: ${:.2f}", mode, balance)
 
@@ -97,6 +146,8 @@ class BinanceClient:
     ) -> list[Candle]:
         """Fetch OHLCV candles for a symbol."""
         assert self._exchange is not None
+        if self.is_rate_limited():
+            return []
         try:
             ohlcv = await self._exchange.fetch_ohlcv(
                 symbol, timeframe=interval, limit=limit,
@@ -115,6 +166,7 @@ class BinanceClient:
                 for bar in ohlcv
             ]
         except Exception as e:
+            self._remember_rate_limit(e)
             logger.error("Failed to fetch candles for {}: {}", symbol, e)
             return []
 
@@ -127,6 +179,7 @@ class BinanceClient:
             return self._exchange_info
 
         assert self._exchange is not None
+        self._raise_if_rate_limited()
         self._exchange_info = await self._exchange.fapiPublicGetExchangeInfo()
         return self._exchange_info
 
@@ -136,33 +189,58 @@ class BinanceClient:
         Returns dict keyed by symbol.
         """
         assert self._exchange is not None
-        tickers = await self._exchange.fetch_tickers()
-        return tickers
+        self._raise_if_rate_limited()
+        try:
+            tickers = await self._exchange.fetch_tickers()
+            return tickers
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
     async def fetch_ticker(self, symbol: str) -> dict:
         """Fetch single symbol ticker."""
         assert self._exchange is not None
-        return await self._exchange.fetch_ticker(symbol)
+        self._raise_if_rate_limited()
+        try:
+            return await self._exchange.fetch_ticker(symbol)
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
     # ── Account ────────────────────────────────────────────
 
     async def get_balance(self) -> float:
         """Get available USDT balance."""
         assert self._exchange is not None
-        balance = await self._exchange.fetch_balance()
-        return float(balance.get("USDT", {}).get("free", 0))
+        self._raise_if_rate_limited()
+        try:
+            balance = await self._exchange.fetch_balance()
+            return float(balance.get("USDT", {}).get("free", 0))
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
     async def get_total_balance(self) -> float:
         """Get total USDT balance (including margin)."""
         assert self._exchange is not None
-        balance = await self._exchange.fetch_balance()
-        return float(balance.get("USDT", {}).get("total", 0))
+        self._raise_if_rate_limited()
+        try:
+            balance = await self._exchange.fetch_balance()
+            return float(balance.get("USDT", {}).get("total", 0))
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
     async def get_positions(self) -> list[dict]:
         """Get all open positions."""
         assert self._exchange is not None
-        positions = await self._exchange.fetch_positions()
-        return [p for p in positions if float(p.get("contracts", 0)) > 0]
+        self._raise_if_rate_limited()
+        try:
+            positions = await self._exchange.fetch_positions()
+            return [p for p in positions if float(p.get("contracts", 0)) > 0]
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
     async def get_position(self, symbol: str) -> dict | None:
         """Get the open position for a symbol, if any."""
@@ -170,6 +248,16 @@ class BinanceClient:
             if position.get("symbol") == symbol:
                 return position
         return None
+
+    async def get_my_trades(self, symbol: str, limit: int = 100) -> list[dict]:
+        """Fetch recent account trades for a symbol."""
+        assert self._exchange is not None
+        self._raise_if_rate_limited()
+        try:
+            return await self._exchange.fetch_my_trades(symbol, limit=limit)
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         """Get open regular + conditional algo orders.
@@ -179,13 +267,18 @@ class BinanceClient:
         fetch_open_orders() can miss them, which breaks recovery and cleanup.
         """
         assert self._exchange is not None
+        self._raise_if_rate_limited()
         orders: list[dict] = []
 
-        if symbol:
-            orders.extend(await self._exchange.fetch_open_orders(symbol))
-        else:
-            self._exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
-            orders.extend(await self._exchange.fetch_open_orders())
+        try:
+            if symbol:
+                orders.extend(await self._exchange.fetch_open_orders(symbol))
+            else:
+                self._exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+                orders.extend(await self._exchange.fetch_open_orders())
+        except Exception as e:
+            self._remember_rate_limit(e)
+            raise
 
         try:
             params = {}
@@ -212,6 +305,7 @@ class BinanceClient:
                     "info": order,
                 })
         except Exception as e:
+            self._remember_rate_limit(e)
             logger.debug("Could not fetch open algo orders for {}: {}", symbol or "all", e)
 
         return orders

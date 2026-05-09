@@ -8,6 +8,7 @@ and heartbeat messages to the configured Telegram chat.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from html import escape
 from typing import Any
 
 from loguru import logger
@@ -61,26 +62,146 @@ class TelegramNotifier:
 
     # ── Signal Messages ────────────────────────────────────
 
+    def _fib_level_info(self, signal: Signal) -> str:
+        """Build Fibonacci entry-level details for notifications."""
+        if signal.metadata.get("strategy") != "FIB":
+            return ""
+
+        zone = signal.metadata.get("fib_zone") or {}
+        swing = signal.metadata.get("swing") or {}
+        if not zone:
+            return ""
+
+        level = float(zone.get("level") or 0)
+        level_pct = level * 100
+        zone_low = float(zone.get("low") or 0)
+        zone_high = float(zone.get("high") or 0)
+        swing_start = float(swing.get("start") or 0)
+        swing_end = float(swing.get("end") or 0)
+        swing_low = min(swing_start, swing_end) if swing_start and swing_end else 0
+        swing_high = max(swing_start, swing_end) if swing_start and swing_end else 0
+        impulse_pct = float(swing.get("impulse_pct") or 0)
+        impulse_atr = float(swing.get("impulse_atr") or 0)
+
+        lines = [
+            "🧮 Fib Entry:",
+            f"  Mode:  {signal.metadata.get('mode', 'n/a')}",
+            f"  Level: {zone.get('name', 'n/a')} ({level_pct:.1f}%)",
+            f"  Zone:  ${zone_low:,.6f} - ${zone_high:,.6f}",
+        ]
+        if swing_low and swing_high:
+            lines.extend([
+                f"  High:  ${swing_high:,.6f}",
+                f"  Low:   ${swing_low:,.6f}",
+                f"  Swing: ${swing_start:,.6f} → ${swing_end:,.6f} "
+                f"({impulse_pct:.2f}%, {impulse_atr:.1f} ATR)",
+            ])
+        return "\n".join(lines) + "\n\n"
+
+    def _score_indicator_info(self, signal: Signal) -> str:
+        """Build full score + indicator details for signal notifications."""
+        scores = signal.metadata.get("layer_scores", {}) or {}
+        indicators = signal.metadata.get("indicators", {}) or {}
+        if not indicators:
+            indicators = {
+                "rsi": signal.metadata.get("rsi", 0),
+                "adx": signal.metadata.get("adx", 0),
+                "atr": signal.metadata.get("atr", 0),
+                "volume_ratio": signal.metadata.get("volume_ratio", 0),
+            }
+
+        rating = escape(str(signal.quality or "n/a"))
+        score_pct = (signal.confluence_score / 13 * 100) if signal.confluence_score else 0
+        strategy_name = escape(str(signal.metadata.get("strategy", "n/a")))
+        strategy_mode = escape(str(signal.metadata.get("mode", "n/a")))
+        score_lines = [
+            "📊 Score / Rating:",
+            f"  Strategy:    {strategy_name} / {strategy_mode}",
+            f"  Score:       {signal.confluence_score}/13 ({score_pct:.0f}%)",
+            f"  Rating:      {rating}",
+            "",
+            "🧩 Strategy Scores:",
+            f"  {strategy_name:<12} {signal.confluence_score}/13 — {rating}",
+        ]
+        preferred = [
+            "regime", "trend", "fib", "level", "early_touch",
+            "rejection", "divergence", "volume", "candle",
+        ]
+        max_scores = {
+            "regime": 2,
+            "trend": 2,
+            "fib": 3,
+            "level": 3,
+            "early_touch": 1,
+            "rejection": 2,
+            "divergence": 3,
+            "volume": 2,
+            "candle": 1,
+        }
+        seen = set()
+        for key in preferred:
+            if key in scores:
+                label = key.replace("_", " ").title()
+                value = scores.get(key)
+                max_value = max_scores.get(key)
+                suffix = f"/{max_value}" if max_value is not None else ""
+                score_lines.append(f"  {label:<12} {value}{suffix}")
+                seen.add(key)
+        for key, value in scores.items():
+            if key not in seen:
+                label = str(key).replace("_", " ").title()
+                max_value = max_scores.get(str(key))
+                suffix = f"/{max_value}" if max_value is not None else ""
+                score_lines.append(f"  {label:<12} {value}{suffix}")
+
+        def num(name: str, default: float = 0.0) -> float:
+            try:
+                return float(indicators.get(name, default) or 0)
+            except Exception:
+                return default
+
+        near_levels = indicators.get("near_levels") or []
+        if isinstance(near_levels, list):
+            near = ", ".join(
+                escape(str(level.get("name", level))) if isinstance(level, dict) else escape(str(level))
+                for level in near_levels[:4]
+            ) or "none"
+        else:
+            near = escape(str(near_levels))
+
+        indicator_lines = [
+            "📈 Indicators:",
+            f"  Price:       ${num('current_price'):,.6f}",
+            f"  RSI:         {num('rsi'):.1f}",
+            f"  ADX:         {num('adx'):.1f}",
+            f"  ATR:         {num('atr'):,.6f} ({num('atr_pct'):.2f}%)",
+            f"  BB Width %:  {num('bb_width_percentile'):.1f}",
+            f"  EMA50 5m:    ${num('ema_50_5m'):,.6f}",
+            f"  EMA50 15m:   ${num('ema_50_15m'):,.6f}",
+            f"  EMA200 1h:   ${num('ema_200_1h'):,.6f}",
+            f"  VWAP:        ${num('vwap'):,.6f}",
+            f"  Trend Bias:  {escape(str(indicators.get('trend_bias', 'n/a')))}",
+            f"  Volume:      {num('current_volume'):,.0f} / SMA20 {num('volume_sma_20'):,.0f} ({num('volume_ratio'):.2f}x)",
+            f"  Divergence:  {escape(str(indicators.get('divergence_type', 'NONE')))} ({num('divergence_strength'):.2f})",
+            f"  Candle:      {escape(str(indicators.get('candle_pattern', 'NONE')))}",
+            f"  Prev H/L:    ${num('prev_session_high'):,.6f} / ${num('prev_session_low'):,.6f}",
+            f"  Near Levels: {near}",
+        ]
+        return "\n".join(score_lines + [""] + indicator_lines) + "\n"
+
     async def signal_detected(self, signal: Signal) -> None:
         """Notify about a new signal."""
-        scores = signal.metadata.get("layer_scores", {})
+        fib_info = self._fib_level_info(signal)
+        details = self._score_indicator_info(signal)
         msg = (
             f"🔍 <b>Signal Detected</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>{signal.direction}</b> {signal.symbol}\n"
-            f"Score: <b>{signal.confluence_score}/13</b> ({signal.quality})\n"
+            f"Score/Rating: <b>{signal.confluence_score}/13 — {escape(str(signal.quality))}</b>\n"
             f"Regime: {signal.regime}\n"
             f"\n"
-            f"📊 Layer Breakdown:\n"
-            f"  Regime:     {scores.get('regime', 0)}/2\n"
-            f"  Trend:      {scores.get('trend', 0)}/2\n"
-            f"  Divergence: {scores.get('divergence', 0)}/3\n"
-            f"  Level:      {scores.get('level', 0)}/3\n"
-            f"  Volume:     {scores.get('volume', 0)}/2\n"
-            f"  Candle:     {scores.get('candle', 0)}/1\n"
-            f"\n"
-            f"RSI: {signal.metadata.get('rsi', 0):.1f} | "
-            f"ADX: {signal.metadata.get('adx', 0):.1f}"
+            f"{fib_info}"
+            f"{details}"
         )
         await self._send(msg)
 
@@ -91,18 +212,22 @@ class TelegramNotifier:
             return
 
         direction_emoji = "📈" if signal.direction == "LONG" else "📉"
+        fib_info = self._fib_level_info(signal)
+        details = self._score_indicator_info(signal)
         msg = (
             f"{direction_emoji} <b>Position Opened</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>{signal.direction}</b> {signal.symbol}\n"
+            f"Score/Rating: <b>{signal.confluence_score}/13 — {escape(str(signal.quality))}</b>\n"
             f"Entry: ${trade.entry_fill_price:,.4f}\n"
             f"SL:    ${signal.stop_loss:,.4f}\n"
             f"TP:    ${signal.take_profit:,.4f}\n"
             f"\n"
+            f"{fib_info}"
+            f"{details}\n"
             f"Size:     ${trade.position_size:,.2f}\n"
             f"Margin:   ${trade.margin_used:,.2f}\n"
-            f"Leverage: {trade.leverage}x\n"
-            f"Score:    {signal.confluence_score}/13 ({signal.quality})"
+            f"Leverage: {trade.leverage}x"
         )
         await self._send(msg)
 
