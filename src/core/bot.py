@@ -61,6 +61,7 @@ class Bot:
 
     async def start(self) -> None:
         """Initialize all systems and start the event loop."""
+        self.is_running = True
         logger.info("=" * 60)
         logger.info("FIB Bot — Fibonacci Scalper")
         logger.info("=" * 60)
@@ -86,9 +87,9 @@ class Bot:
         # Initial coin scan
         logger.info("Running initial coin scan...")
         if self.client.is_rate_limited():
-            sleep_s = self.client.rate_limit_sleep_seconds(buffer_seconds=10)
+            sleep_s = self.client.rate_limit_sleep_seconds()
             logger.warning("Initial coin scan paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
-            await asyncio.sleep(sleep_s)
+            await self._sleep_with_shutdown(sleep_s)
             if balance <= 0:
                 try:
                     balance = await self.client.get_balance()
@@ -99,22 +100,21 @@ class Bot:
             if not self.open_positions:
                 await self._recover_positions()
         active_coins: list[str] = []
-        while self.is_running is False and not active_coins:
+        while self.is_running and not active_coins:
             active_coins = await self.screener.scan()
             if active_coins:
                 break
             sleep_s = (
-                self.client.rate_limit_sleep_seconds(buffer_seconds=10)
+                self.client.rate_limit_sleep_seconds()
                 if self.client.is_rate_limited()
                 else 60.0
             )
             logger.warning("Initial coin scan returned no coins; retrying in {:.0f}s", sleep_s)
-            await asyncio.sleep(sleep_s)
+            await self._sleep_with_shutdown(sleep_s)
         logger.info("Active coins ({}): {}", len(active_coins), active_coins)
 
         # Start trading loops immediately. Startup scan logging / Telegram must
         # never block position monitoring or DCA protection.
-        self.is_running = True
 
         async def _startup_side_effects() -> None:
             try:
@@ -163,6 +163,18 @@ class Bot:
         self.db.close()
         logger.info("Bot stopped.")
 
+    async def _sleep_with_shutdown(self, seconds: float, step: float = 1.0) -> None:
+        """Sleep in short chunks so systemd stop/SIGTERM can exit quickly."""
+        deadline = time.time() + max(0.0, seconds)
+        while self.is_running and time.time() < deadline:
+            await asyncio.sleep(min(step, max(0.0, deadline - time.time())))
+
+    async def _sleep_for_rate_limit(self, label: str) -> None:
+        """Pause until the local Binance cooldown ends, but remain stoppable."""
+        sleep_s = self.client.rate_limit_sleep_seconds()
+        logger.warning("{} paused for Binance rate-limit backoff ({:.0f}s)", label, sleep_s)
+        await self._sleep_with_shutdown(sleep_s)
+
     # ── Tier 1: Coin Scanner ──────────────────────────────
 
     async def _tier1_coin_scanner(self) -> None:
@@ -170,14 +182,12 @@ class Bot:
         interval = self.config.rescreen_interval_hours * 3600
 
         # Wait before first re-scan (initial scan already done in start())
-        await asyncio.sleep(interval)
+        await self._sleep_with_shutdown(interval)
 
         while self.is_running:
             try:
                 if self.client.is_rate_limited():
-                    sleep_s = self.client.rate_limit_sleep_seconds(buffer_seconds=10)
-                    logger.warning("Tier 1 scanner paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
-                    await asyncio.sleep(sleep_s)
+                    await self._sleep_for_rate_limit("Tier 1 scanner")
                     continue
 
                 logger.info("━━━ TIER 1: Coin Scanner ━━━")
@@ -205,7 +215,7 @@ class Bot:
                 logger.error("Tier 1 error: {}", e)
                 await self.notifier.error_alert(f"Scanner error: {e}")
 
-            await asyncio.sleep(interval)
+            await self._sleep_with_shutdown(interval)
 
     # ── Tier 2: Signal Checker ────────────────────────────
 
@@ -217,9 +227,7 @@ class Bot:
                 await self._wait_for_candle_close()
 
                 if self.client.is_rate_limited():
-                    sleep_s = self.client.rate_limit_sleep_seconds(buffer_seconds=10)
-                    logger.warning("Signal checker paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
-                    await asyncio.sleep(sleep_s)
+                    await self._sleep_for_rate_limit("Signal checker")
                     continue
 
                 active_coins = self.screener.active_coins
@@ -323,7 +331,7 @@ class Bot:
 
             except Exception as e:
                 logger.error("Tier 2 error: {}", e)
-                await asyncio.sleep(10)
+                await self._sleep_with_shutdown(10)
 
     def _zone_cooldown_reason(self, signal: Signal) -> str:
         """Prevent repeated entries on the same Fib zone after it closes.
@@ -394,9 +402,7 @@ class Bot:
         while self.is_running:
             try:
                 if self.client.is_rate_limited():
-                    sleep_s = min(60.0, self.client.rate_limit_sleep_seconds(buffer_seconds=10))
-                    logger.warning("Position monitor paused for Binance rate-limit backoff ({:.0f}s)", sleep_s)
-                    await asyncio.sleep(sleep_s)
+                    await self._sleep_for_rate_limit("Position monitor")
                     continue
 
                 # First reconcile parent positions. If a 0.5 parent has already
@@ -410,7 +416,7 @@ class Bot:
                 await self._check_pending_entries()
 
                 if not self.open_positions:
-                    await asyncio.sleep(5)
+                    await self._sleep_with_shutdown(5)
                     continue
 
                 for pos in list(self.open_positions):
@@ -459,11 +465,11 @@ class Bot:
 
                 await self._check_portfolio_take_profit()
 
-                await asyncio.sleep(30)
+                await self._sleep_with_shutdown(30)
 
             except Exception as e:
                 logger.error("Tier 3 error: {}", e)
-                await asyncio.sleep(5)
+                await self._sleep_with_shutdown(5)
 
     def _portfolio_take_profit_config(self) -> dict:
         """Portfolio-level TP config for closing all managed positions."""
@@ -1781,8 +1787,7 @@ class Bot:
 
     # ── Timing ─────────────────────────────────────────────
 
-    @staticmethod
-    async def _wait_for_candle_close(interval_minutes: int = 5) -> None:
+    async def _wait_for_candle_close(self, interval_minutes: int = 5) -> None:
         """
         Sleep until next 5-minute candle close.
 
@@ -1803,25 +1808,28 @@ class Bot:
         next_close = now.strftime("%H:%M:%S")
         logger.debug("Waiting {:.0f}s for next candle close...", wait_time)
 
-        await asyncio.sleep(wait_time)
+        await self._sleep_with_shutdown(wait_time)
 
     # ── Heartbeat ──────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
-        """Send hourly heartbeat."""
+        """Send hourly heartbeat without touching Binance during backoff."""
         while self.is_running:
             try:
                 now = time.time()
                 if now - self._last_heartbeat >= self._heartbeat_interval:
-                    balance = await self.client.get_balance()
-                    await self.notifier.heartbeat(
-                        balance, len(self.open_positions),
-                    )
-                    self._last_heartbeat = now
+                    if self.client.is_rate_limited():
+                        logger.warning("Heartbeat skipped during Binance rate-limit backoff")
+                    else:
+                        balance = await self.client.get_balance()
+                        await self.notifier.heartbeat(
+                            balance, len(self.open_positions),
+                        )
+                        self._last_heartbeat = now
 
-                    # Update balance tracking
-                    self.risk_manager.update_balance(balance)
+                        # Update balance tracking
+                        self.risk_manager.update_balance(balance)
             except Exception as e:
                 logger.error("Heartbeat error: {}", e)
 
-            await asyncio.sleep(60)  # Check every minute
+            await self._sleep_with_shutdown(60)  # Check every minute

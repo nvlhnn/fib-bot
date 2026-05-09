@@ -29,6 +29,7 @@ class BinanceClient:
         self._raw_to_unified: dict[str, str] = {}  # Raw symbol → unified symbol map
         self._banned_until_ms = 0
         self._ban_logged_until_ms = 0
+        self._consecutive_bans = 0
 
     # ── Rate-limit / ban backoff ──────────────────────────
 
@@ -39,7 +40,7 @@ class BinanceClient:
     def is_rate_limited(self) -> bool:
         return int(time.time() * 1000) < self._banned_until_ms
 
-    def rate_limit_sleep_seconds(self, buffer_seconds: int = 5) -> float:
+    def rate_limit_sleep_seconds(self, buffer_seconds: int = 600) -> float:
         remaining = (self._banned_until_ms - int(time.time() * 1000)) / 1000
         return max(0.0, remaining + buffer_seconds)
 
@@ -54,21 +55,31 @@ class BinanceClient:
             return
 
         # Binance usually sends a millisecond epoch. If it does not, use a
-        # conservative 60s cool-off so we still stop extending the ban.
-        until_ms = int(match.group(1)) if match else int(time.time() * 1000) + 60_000
+        # conservative 60s cool-off. Add a larger local cooldown on top of the
+        # exchange ban because testnet often re-bans immediately at expiry.
+        raw_until_ms = int(match.group(1)) if match else int(time.time() * 1000) + 60_000
+        now_ms = int(time.time() * 1000)
+        if raw_until_ms > self._banned_until_ms:
+            self._consecutive_bans += 1
+        extra_cooldown_ms = min(120 * 60_000, 10 * 60_000 * max(1, self._consecutive_bans))
+        until_ms = max(raw_until_ms, now_ms + 60_000) + extra_cooldown_ms
         self._banned_until_ms = max(self._banned_until_ms, until_ms)
 
         if self._ban_logged_until_ms != self._banned_until_ms:
             self._ban_logged_until_ms = self._banned_until_ms
             wait_s = self.rate_limit_sleep_seconds(buffer_seconds=0)
             logger.warning(
-                "Binance rate-limit ban detected; pausing API calls for {:.0f}s until {}",
-                wait_s, self._banned_until_ms,
+                "Binance rate-limit ban detected; local cooldown {:.0f}s until {} (consecutive bans={})",
+                wait_s, self._banned_until_ms, self._consecutive_bans,
             )
 
     def _raise_if_rate_limited(self) -> None:
         if self.is_rate_limited():
             raise RuntimeError(self._rate_limit_message())
+
+    def _remember_api_success(self) -> None:
+        """Reset ban streak after a real Binance response succeeds."""
+        self._consecutive_bans = 0
 
     # ── Connection ─────────────────────────────────────────
 
@@ -152,6 +163,7 @@ class BinanceClient:
             ohlcv = await self._exchange.fetch_ohlcv(
                 symbol, timeframe=interval, limit=limit,
             )
+            self._remember_api_success()
             return [
                 Candle(
                     timestamp=int(bar[0]),
@@ -192,6 +204,7 @@ class BinanceClient:
         self._raise_if_rate_limited()
         try:
             tickers = await self._exchange.fetch_tickers()
+            self._remember_api_success()
             return tickers
         except Exception as e:
             self._remember_rate_limit(e)
@@ -202,7 +215,9 @@ class BinanceClient:
         assert self._exchange is not None
         self._raise_if_rate_limited()
         try:
-            return await self._exchange.fetch_ticker(symbol)
+            ticker = await self._exchange.fetch_ticker(symbol)
+            self._remember_api_success()
+            return ticker
         except Exception as e:
             self._remember_rate_limit(e)
             raise
@@ -215,6 +230,7 @@ class BinanceClient:
         self._raise_if_rate_limited()
         try:
             balance = await self._exchange.fetch_balance()
+            self._remember_api_success()
             return float(balance.get("USDT", {}).get("free", 0))
         except Exception as e:
             self._remember_rate_limit(e)
@@ -226,6 +242,7 @@ class BinanceClient:
         self._raise_if_rate_limited()
         try:
             balance = await self._exchange.fetch_balance()
+            self._remember_api_success()
             return float(balance.get("USDT", {}).get("total", 0))
         except Exception as e:
             self._remember_rate_limit(e)
@@ -237,6 +254,7 @@ class BinanceClient:
         self._raise_if_rate_limited()
         try:
             positions = await self._exchange.fetch_positions()
+            self._remember_api_success()
             return [p for p in positions if float(p.get("contracts", 0)) > 0]
         except Exception as e:
             self._remember_rate_limit(e)
@@ -254,7 +272,9 @@ class BinanceClient:
         assert self._exchange is not None
         self._raise_if_rate_limited()
         try:
-            return await self._exchange.fetch_my_trades(symbol, limit=limit)
+            trades = await self._exchange.fetch_my_trades(symbol, limit=limit)
+            self._remember_api_success()
+            return trades
         except Exception as e:
             self._remember_rate_limit(e)
             raise
