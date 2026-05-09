@@ -180,7 +180,8 @@ class Bot:
         ws_cfg = md_cfg.get("websocket", {}) or {}
         if self.config.market_data_mode != "websocket" or not ws_cfg.get("enabled", False):
             return
-        if not active_coins:
+        symbols = self._market_data_symbols(active_coins)
+        if not symbols:
             logger.warning("Websocket market data requested but active coin list is empty")
             return
 
@@ -194,22 +195,33 @@ class Bot:
 
         bootstrap_cfg = md_cfg.get("rest_bootstrap", {}) or {}
         await self.ws_candle_store.bootstrap_history(
-            active_coins,
+            symbols,
             timeframes,
             batch_size=int(bootstrap_cfg.get("batch_size", 2)),
             delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
         )
         if self.client.is_rate_limited():
-            await self._sleep_for_rate_limit("Websocket market data startup")
+            logger.warning("Websocket bootstrap hit Binance backoff; starting live streams without waiting")
         if not self.is_running:
             return
 
         await self.ws_candle_store.start(
-            active_coins,
+            symbols,
             timeframes,
             include_mark_price=bool(ws_cfg.get("mark_price_enabled", True)),
             mark_price_interval=str(ws_cfg.get("mark_price_interval", "1s")),
         )
+
+    def _market_data_symbols(self, active_coins: list[str]) -> list[str]:
+        """Active scan symbols plus any recovered/open position symbols."""
+        symbols = list(active_coins)
+        for pos in self.open_positions:
+            if pos.trade.signal:
+                symbols.append(pos.trade.signal.symbol)
+        for trade in self.pending_entries.values():
+            if trade.signal:
+                symbols.append(trade.signal.symbol)
+        return list(dict.fromkeys(symbols))
 
     async def _sleep_with_shutdown(self, seconds: float, step: float = 1.0) -> None:
         """Sleep in short chunks so systemd stop/SIGTERM can exit quickly."""
@@ -253,14 +265,16 @@ class Bot:
                 if self.ws_candle_store and new_coins:
                     ws_cfg = self.config.market_data_config.get("websocket", {}) or {}
                     timeframes = list(ws_cfg.get("timeframes") or ["5m", "15m", "1h"])
-                    await self.ws_candle_store.update_symbols(new_coins)
+                    symbols = self._market_data_symbols(new_coins)
+                    await self.ws_candle_store.update_symbols(symbols)
                     bootstrap_cfg = self.config.market_data_config.get("rest_bootstrap", {}) or {}
-                    await self.ws_candle_store.bootstrap_history(
-                        new_coins,
-                        timeframes,
-                        batch_size=int(bootstrap_cfg.get("batch_size", 2)),
-                        delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
-                    )
+                    if not self.client.is_rate_limited():
+                        await self.ws_candle_store.bootstrap_history(
+                            symbols,
+                            timeframes,
+                            batch_size=int(bootstrap_cfg.get("batch_size", 2)),
+                            delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
+                        )
 
                 # Log scan
                 scores = self.screener.get_scores()
@@ -478,14 +492,14 @@ class Bot:
         """Monitor pending entries and open positions every 30 seconds."""
         while self.is_running:
             try:
-                if self.client.is_rate_limited():
+                if self.client.is_rate_limited() and not self.ws_candle_store:
                     await self._sleep_for_rate_limit("Position monitor")
                     continue
 
                 # Reconcile exchange state periodically instead of every 30s.
                 # Order/position truth remains REST, but websocket mark prices
                 # handle normal PnL/exit monitoring between reconciliations.
-                if self._should_reconcile_positions():
+                if self._should_reconcile_positions() and not self.client.is_rate_limited():
                     # First reconcile parent positions. If a 0.5 parent has already
                     # closed by TP/SL/manual, cancel its still-resting 0.618 DCA
                     # before checking pending entries, so the DCA cannot become a
@@ -495,7 +509,8 @@ class Bot:
                     self._last_position_reconcile = time.time()
 
                 # Then check pending entry fills.
-                await self._check_pending_entries()
+                if not self.client.is_rate_limited():
+                    await self._check_pending_entries()
 
                 if not self.open_positions:
                     await self._sleep_with_shutdown(5)
