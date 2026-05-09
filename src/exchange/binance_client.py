@@ -8,8 +8,10 @@ placing orders, managing positions, and querying account state.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import ccxt.async_support as ccxt
@@ -30,6 +32,8 @@ class BinanceClient:
         self._banned_until_ms = 0
         self._ban_logged_until_ms = 0
         self._consecutive_bans = 0
+        self._backoff_file = Path(__file__).resolve().parent.parent.parent / "data" / "binance_backoff.json"
+        self._load_rate_limit_state()
 
     # ── Rate-limit / ban backoff ──────────────────────────
 
@@ -46,6 +50,37 @@ class BinanceClient:
 
     def _rate_limit_message(self) -> str:
         return f"Binance API temporarily banned until {self._banned_until_ms}"
+
+    def _load_rate_limit_state(self) -> None:
+        try:
+            if not self._backoff_file.exists():
+                return
+            data = json.loads(self._backoff_file.read_text(encoding="utf-8"))
+            banned_until_ms = int(data.get("banned_until_ms") or 0)
+            consecutive_bans = int(data.get("consecutive_bans") or 0)
+            if banned_until_ms > int(time.time() * 1000):
+                self._banned_until_ms = banned_until_ms
+                self._consecutive_bans = max(0, consecutive_bans)
+                logger.warning(
+                    "Loaded persisted Binance backoff until {} (consecutive bans={})",
+                    self._banned_until_ms, self._consecutive_bans,
+                )
+        except Exception as e:
+            logger.debug("Could not load Binance backoff state: {}", e)
+
+    def _save_rate_limit_state(self) -> None:
+        try:
+            self._backoff_file.parent.mkdir(parents=True, exist_ok=True)
+            self._backoff_file.write_text(
+                json.dumps({
+                    "banned_until_ms": self._banned_until_ms,
+                    "consecutive_bans": self._consecutive_bans,
+                    "updated_at_ms": int(time.time() * 1000),
+                }),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug("Could not save Binance backoff state: {}", e)
 
     def _remember_rate_limit(self, error: Exception) -> None:
         """Record Binance 418 ban windows so loops stop hammering testnet."""
@@ -67,6 +102,7 @@ class BinanceClient:
 
         if self._ban_logged_until_ms != self._banned_until_ms:
             self._ban_logged_until_ms = self._banned_until_ms
+            self._save_rate_limit_state()
             wait_s = self.rate_limit_sleep_seconds(buffer_seconds=0)
             logger.warning(
                 "Binance rate-limit ban detected; local cooldown {:.0f}s until {} (consecutive bans={})",
