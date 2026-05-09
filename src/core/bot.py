@@ -309,7 +309,7 @@ class Bot:
                 # Wait for next candle close
                 await self._wait_for_candle_close()
 
-                if self.client.is_rate_limited():
+                if self.client.is_rate_limited() and not self.ws_candle_store:
                     await self._sleep_for_rate_limit("Signal checker")
                     continue
 
