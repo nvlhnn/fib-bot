@@ -107,6 +107,15 @@ class Bot:
             active_coins = await self.screener.scan()
             if active_coins:
                 break
+            if (
+                self.config.market_data_mode == "websocket"
+                and self.client.is_rate_limited()
+                and self.open_positions
+            ):
+                logger.warning(
+                    "Initial scan blocked by Binance backoff; starting websocket market data for open positions"
+                )
+                break
             sleep_s = (
                 self.client.rate_limit_sleep_seconds()
                 if self.client.is_rate_limited()
