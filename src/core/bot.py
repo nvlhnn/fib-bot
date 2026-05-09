@@ -1893,8 +1893,18 @@ class Bot:
                         elif "profit" in otype:
                             trade.tp_order_id = str(order.get("id", ""))
                             signal.take_profit = float(order.get("stopPrice", 0) or 0)
-                except Exception:
-                    logger.warning("Could not fetch open orders for {}", symbol)
+                except Exception as e:
+                    logger.warning("Could not fetch open orders for {}: {}", symbol, e)
+                    if db_trade:
+                        trade.stop_order_id = str(db_trade.get("stop_order_id") or "")
+                        trade.tp_order_id = str(db_trade.get("tp_order_id") or "")
+                        signal.stop_loss = float(db_trade.get("stop_loss") or 0)
+                        signal.take_profit = float(db_trade.get("take_profit") or 0)
+                        if trade.stop_order_id or trade.tp_order_id:
+                            logger.warning(
+                                "Recovered {} {} protection from DB while exchange orders are unavailable",
+                                direction, symbol,
+                            )
 
                 if not trade.stop_order_id and not trade.tp_order_id:
                     logger.warning(
