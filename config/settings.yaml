@@ -174,6 +174,7 @@ market_data:
   rest_bootstrap:
     batch_size: 2
     delay_seconds: 1.5
+    retry_interval_seconds: 300
     cooldown_after_418_minutes: 10
 
 # ──────────────────────────────────────────────────────────

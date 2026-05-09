@@ -59,6 +59,7 @@ class Bot:
         self._last_heartbeat = 0.0
         self._heartbeat_interval = 3600  # 1 hour
         self._last_position_reconcile = 0.0
+        self._last_ws_bootstrap_retry = 0.0
 
     # ── Lifecycle ──────────────────────────────────────────
 
@@ -420,7 +421,11 @@ class Bot:
         candle calls. REST mode keeps the existing CandleCache behavior.
         """
         if self.config.market_data_mode == "websocket" and self.ws_candle_store:
-            ready = self.ws_candle_store.ready_symbols(["5m", "15m", "1h"])
+            required_timeframes = ["5m", "15m", "1h"]
+            ready = self.ws_candle_store.ready_symbols(required_timeframes)
+            if not ready:
+                await self._retry_ws_bootstrap_if_due(active_coins, required_timeframes)
+                ready = self.ws_candle_store.ready_symbols(required_timeframes)
             if not ready:
                 logger.warning("Websocket candle store has no ready symbols yet")
                 return {}
@@ -432,6 +437,36 @@ class Bot:
 
         # REST fallback/default.
         return await self.candle_cache.update(active_coins, self.client)
+
+    async def _retry_ws_bootstrap_if_due(self, active_coins: list[str], timeframes: list[str]) -> None:
+        """Retry REST history bootstrap after Binance backoff clears.
+
+        If startup hits a 418, websocket streams can connect but indicators have
+        no history. This retries conservatively from the signal loop instead of
+        waiting hours for the next scanner rotation.
+        """
+        if not self.ws_candle_store or self.client.is_rate_limited():
+            return
+
+        md_cfg = self.config.market_data_config
+        bootstrap_cfg = md_cfg.get("rest_bootstrap", {}) or {}
+        retry_interval = float(bootstrap_cfg.get("retry_interval_seconds", 300))
+        now = time.time()
+        if now - self._last_ws_bootstrap_retry < max(60.0, retry_interval):
+            return
+
+        symbols = self._market_data_symbols(active_coins)
+        if not symbols:
+            return
+
+        self._last_ws_bootstrap_retry = now
+        logger.info("Retrying websocket historical bootstrap for {} symbols", len(symbols))
+        await self.ws_candle_store.bootstrap_history(
+            symbols,
+            timeframes,
+            batch_size=int(bootstrap_cfg.get("batch_size", 2)),
+            delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
+        )
 
     def _zone_cooldown_reason(self, signal: Signal) -> str:
         """Prevent repeated entries on the same Fib zone after it closes.
