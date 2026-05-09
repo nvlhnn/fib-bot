@@ -157,10 +157,10 @@ screening:
 market_data:
   # Phase 2 adds websocket candle infrastructure behind this flag. The bot still
   # uses REST candles until Phase 3/4 wiring is complete.
-  mode: "rest"  # rest | websocket
+  mode: "websocket"  # rest | websocket
 
   websocket:
-    enabled: false
+    enabled: true
     timeframes: ["5m", "15m", "1h"]
     max_streams_per_connection: 50
     reconnect_base_delay_seconds: 5

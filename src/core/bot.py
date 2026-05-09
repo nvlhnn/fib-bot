@@ -244,6 +244,18 @@ class Bot:
                 if added or removed:
                     await self.notifier.coin_rotation(added, removed, new_coins)
 
+                if self.ws_candle_store and new_coins:
+                    ws_cfg = self.config.market_data_config.get("websocket", {}) or {}
+                    timeframes = list(ws_cfg.get("timeframes") or ["5m", "15m", "1h"])
+                    await self.ws_candle_store.update_symbols(new_coins)
+                    bootstrap_cfg = self.config.market_data_config.get("rest_bootstrap", {}) or {}
+                    await self.ws_candle_store.bootstrap_history(
+                        new_coins,
+                        timeframes,
+                        batch_size=int(bootstrap_cfg.get("batch_size", 2)),
+                        delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
+                    )
+
                 # Log scan
                 scores = self.screener.get_scores()
                 self.db.log_scan(
@@ -282,10 +294,7 @@ class Bot:
                     len(active_coins),
                 )
 
-                # Fetch candle data (with smart caching)
-                candle_data = await self.candle_cache.update(
-                    active_coins, self.client,
-                )
+                candle_data = await self._get_signal_candle_data(active_coins)
 
                 # Process each coin
                 all_signals: list[Signal] = []
@@ -374,6 +383,26 @@ class Bot:
             except Exception as e:
                 logger.error("Tier 2 error: {}", e)
                 await self._sleep_with_shutdown(10)
+
+    async def _get_signal_candle_data(self, active_coins: list[str]) -> dict[str, dict[str, list]]:
+        """Return candle data for signal evaluation.
+
+        In websocket mode, this is a local in-memory snapshot and makes no REST
+        candle calls. REST mode keeps the existing CandleCache behavior.
+        """
+        if self.config.market_data_mode == "websocket" and self.ws_candle_store:
+            ready = self.ws_candle_store.ready_symbols(["5m", "15m", "1h"])
+            if not ready:
+                logger.warning("Websocket candle store has no ready symbols yet")
+                return {}
+            usable = [symbol for symbol in active_coins if symbol in ready]
+            skipped = len(active_coins) - len(usable)
+            if skipped:
+                logger.info("Websocket candle data not ready for {} symbols", skipped)
+            return self.ws_candle_store.snapshot(usable)
+
+        # REST fallback/default.
+        return await self.candle_cache.update(active_coins, self.client)
 
     def _zone_cooldown_reason(self, signal: Signal) -> str:
         """Prevent repeated entries on the same Fib zone after it closes.
