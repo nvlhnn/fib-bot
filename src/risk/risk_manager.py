@@ -324,7 +324,7 @@ class RiskManager:
                 same_dir_count += 1
 
         max_same = self._cfg.risk_config.get("limits", {}).get("max_same_direction", 2)
-        if same_dir_count >= max_same:
+        if max_same and max_same > 0 and same_dir_count >= max_same:
             return False, f"Max same-direction ({max_same}) reached"
 
         return True, "OK"
