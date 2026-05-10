@@ -23,7 +23,7 @@ strategy:
     fixed_margin_usdt: 12.5
     fixed_leverage: 20
     stop_loss_usdt: 10.0
-    take_profit_usdt: 20.0
+    take_profit_usdt: 15.0
     pullback_take_profit_retracement: 0.236
     shallow_entry_stop_level: 0.618
     deep_entry_stop_level: 0.786
