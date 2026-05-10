@@ -206,24 +206,27 @@ class Bot:
             reconnect_max_delay_seconds=float(ws_cfg.get("reconnect_max_delay_seconds", 120)),
         )
 
-        bootstrap_cfg = md_cfg.get("rest_bootstrap", {}) or {}
-        await self.ws_candle_store.bootstrap_history(
-            symbols,
-            timeframes,
-            batch_size=int(bootstrap_cfg.get("batch_size", 2)),
-            delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
-        )
-        if self.client.is_rate_limited():
-            logger.warning("Websocket bootstrap hit Binance backoff; starting live streams without waiting")
-        if not self.is_running:
-            return
-
         await self.ws_candle_store.start(
             symbols,
             timeframes,
             include_mark_price=bool(ws_cfg.get("mark_price_enabled", True)),
             mark_price_interval=str(ws_cfg.get("mark_price_interval", "1s")),
         )
+        if not self.is_running:
+            return
+
+        bootstrap_cfg = md_cfg.get("rest_bootstrap", {}) or {}
+        if bootstrap_cfg.get("enabled", False):
+            await self.ws_candle_store.bootstrap_history(
+                symbols,
+                timeframes,
+                batch_size=int(bootstrap_cfg.get("batch_size", 2)),
+                delay_seconds=float(bootstrap_cfg.get("delay_seconds", 1.5)),
+            )
+            if self.client.is_rate_limited():
+                logger.warning("Websocket bootstrap hit Binance backoff; live streams remain active")
+        else:
+            logger.info("REST candle bootstrap disabled; using websocket live candles only")
 
     def _market_data_symbols(self, active_coins: list[str]) -> list[str]:
         """Active scan symbols plus any recovered/open position symbols."""
@@ -281,7 +284,7 @@ class Bot:
                     symbols = self._market_data_symbols(new_coins)
                     await self.ws_candle_store.update_symbols(symbols)
                     bootstrap_cfg = self.config.market_data_config.get("rest_bootstrap", {}) or {}
-                    if not self.client.is_rate_limited():
+                    if bootstrap_cfg.get("enabled", False) and not self.client.is_rate_limited():
                         await self.ws_candle_store.bootstrap_history(
                             symbols,
                             timeframes,
@@ -453,6 +456,8 @@ class Bot:
 
         md_cfg = self.config.market_data_config
         bootstrap_cfg = md_cfg.get("rest_bootstrap", {}) or {}
+        if not bootstrap_cfg.get("enabled", False):
+            return
         retry_interval = float(bootstrap_cfg.get("retry_interval_seconds", 300))
         now = time.time()
         if now - self._last_ws_bootstrap_retry < max(60.0, retry_interval):

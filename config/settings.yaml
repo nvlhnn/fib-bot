@@ -173,9 +173,10 @@ market_data:
     reconcile_interval_seconds: 300
 
   rest_bootstrap:
-    batch_size: 2
-    delay_seconds: 1.5
-    retry_interval_seconds: 300
+    enabled: false
+    batch_size: 1
+    delay_seconds: 5.0
+    retry_interval_seconds: 1800
     cooldown_after_418_minutes: 10
 
 # ──────────────────────────────────────────────────────────

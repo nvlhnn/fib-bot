@@ -38,6 +38,10 @@ class BinanceClient:
     # ── Rate-limit / ban backoff ──────────────────────────
 
     @property
+    def config(self) -> Config:
+        return self._cfg
+
+    @property
     def banned_until_ms(self) -> int:
         return self._banned_until_ms
 

@@ -25,18 +25,23 @@ from src.exchange.binance_client import BinanceClient
 class WebSocketCandleStore:
     """Maintain Binance kline candles from websocket streams."""
 
-    BASE_URL = "wss://fstream.binance.com/stream?streams="
+    MAINNET_BASE_URL = "wss://fstream.binance.com/stream?streams="
+    TESTNET_BASE_URL = "wss://stream.binancefuture.com/stream?streams="
 
     def __init__(
         self,
         client: BinanceClient,
         *,
+        base_url: str | None = None,
         max_history: dict[str, int] | None = None,
         max_streams_per_connection: int = 50,
         reconnect_base_delay_seconds: float = 5.0,
         reconnect_max_delay_seconds: float = 120.0,
     ) -> None:
         self._client = client
+        self._base_url = base_url or (
+            self.TESTNET_BASE_URL if client.config.is_testnet else self.MAINNET_BASE_URL
+        )
         self._max_history = max_history or {"5m": 200, "15m": 100, "1h": 200}
         self._max_streams_per_connection = max(1, max_streams_per_connection)
         self._reconnect_base_delay = reconnect_base_delay_seconds
@@ -239,7 +244,7 @@ class WebSocketCandleStore:
         return [items[i:i + size] for i in range(0, len(items), size)]
 
     async def _run_connection(self, streams: list[str]) -> None:
-        url = self.BASE_URL + "/".join(streams)
+        url = self._base_url + "/".join(streams)
         delay = self._reconnect_base_delay
         while self._running:
             try:
@@ -275,7 +280,7 @@ class WebSocketCandleStore:
                 return
 
             kline = data.get("k", {})
-            if not kline or not kline.get("x"):
+            if not kline:
                 return
 
             raw_symbol = str(kline.get("s", "")).upper()
