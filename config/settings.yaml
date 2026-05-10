@@ -238,7 +238,7 @@ risk:
   limits:
     max_open_positions: 0  # 0 or lower = unlimited
     max_daily_trades: 0
-    max_same_direction: 4
+    max_same_direction: 0
 
   circuit_breakers:
     daily_loss:
